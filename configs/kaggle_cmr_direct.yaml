@@ -1,0 +1,91 @@
+# The direct predictor alone, trained afresh on posterior samples of the
+# frozen VAE of kaggle_cmr.yaml. The data, model and
+# likelihood sections must match that run's, which built the VAE.
+# Options and defaults: see DEFAULTS in src/mrisr_vae/train.py. Paths are
+# relative to the repository root.
+#
+#   sbatch slurm/train.sh configs/kaggle_cmr_direct.yaml --resume
+
+geometry: configs/kaggle_cmr_geometry.yaml
+# Its own directory: best.pt and last.pt hold the frozen VAE and the new
+# direct predictor, so mrisr-predict loads either as usual.
+checkpoint_dir: ../scratch/checkpoints/kaggle_cmr_direct
+device: cuda
+seed: 0
+split_seed: 42  # the same validation subjects as diffusion-priors
+
+data:
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/train
+  # The direct predictor's input has view dropout, as when trained with the VAE.
+  view_drop_probability: 0.3
+  heldout_views: [la_4ch]
+  batch_size: 2
+  num_workers: 8
+
+model:
+  n_layers: 8
+  z_dim: 64
+  n_filters: 64
+  blocks_per_layer: 1
+  downsampling: auto
+  scale_initialisation: false
+  checkpointed: true
+  direct_predictor: true
+
+likelihood:
+  noise: global
+  learn_noise: true
+  init_sigma: 0.05
+  relative_std:
+    la_2ch: 4
+  noise_lr: 0.01
+  min_sigma: 0.001
+
+train:
+  # The VAE (Ladder VAE and noise) to train on; its direct predictor is not
+  # loaded. On --resume, last.pt here takes over.
+  pretrained_vae: ../scratch/checkpoints/kaggle_cmr/best.pt
+  direct_only: true
+  # The direct predictor's error against fixed posterior samples of the
+  # validation set (val/direct_heldout_mse: its held-out-view error instead).
+  monitor: val/direct_mse
+  lr: 3.0e-4
+  lr_warmup_steps: 100
+  grad_batches: 4
+  clip: 1.0
+  max_epochs: 1000
+  # Under the SLURM time limit (1-8 in slurm/train.sh), so the job stops
+  # cleanly and --resume carries on.
+  max_hours: 30
+  # Early stopping, as for the VAE. No learning-rate plateaus with direct_only.
+  patience: 50
+  image_every: 5
+  amp: true
+
+wandb:
+  project: mrisr-vae
+  mode: online
+
+# mrisr-predict --config only (sbatch slurm/predict.sh <this config>).
+predict:
+  checkpoint: best
+  out_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  split: all
+  frame: 0
+  method: direct
+  n_samples: 0
+  save_samples: false
+
+# mrisr-evaluate --config only (sbatch slurm/evaluate.sh <this config>).
+# As kaggle_cmr.yaml's, but without samples: the VAE is kaggle_cmr's, frozen,
+# so they would repeat that evaluation. Scores the retrained direct predictor.
+evaluate:
+  checkpoint: best
+  out_dir: ../scratch/checkpoints/kaggle_cmr_direct/evaluation_test_best
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  conditioning_views: [all, sa, la_2ch]
+  frame: null
+  n_samples: 0
+  seed: 0
+  save_predictions: true

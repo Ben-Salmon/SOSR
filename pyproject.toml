@@ -1,0 +1,39 @@
+[project]
+name = "mrisr-vae"
+version = "0.1.0"
+description = "Empirical-Bayes priors for through-plane MRI super-resolution with a Ladder VAE"
+readme = "README.md"
+authors = [
+    { name = "Benjamin Salmon", email = "benjamin.salmon@manchester.ac.uk" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "nibabel>=5.2",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
+    "torch>=2.8.0",
+    "tqdm>=4.66",
+    "wandb>=0.18",
+]
+
+[project.scripts]
+mrisr-train = "mrisr_vae.train:main"
+mrisr-predict = "mrisr_vae.predict:main"
+mrisr-evaluate = "mrisr_vae.evaluate:main"
+mrisr-score = "mrisr_vae.metrics:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

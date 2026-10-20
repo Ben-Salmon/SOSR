@@ -1,0 +1,94 @@
+# Supervised baseline: the VAE's direct predictor (the same UNet, on the same
+# backprojected input of the training views), trained from scratch against
+# la_4ch through la_4ch's forward model, by mean squared error. The data,
+# model and likelihood sections are kaggle_cmr.yaml's, so the network and its
+# input are the VAE's. Options and defaults: see DEFAULTS in
+# src/mrisr_vae/train.py. Paths are relative to the repository root.
+#
+#   sbatch slurm/train.sh configs/kaggle_cmr_supervised.yaml --resume
+#
+# la_4ch is held out from the input, not from training, so score this model
+# on the test set: sbatch slurm/evaluate.sh configs/kaggle_cmr_supervised.yaml
+
+geometry: configs/kaggle_cmr_geometry.yaml
+checkpoint_dir: ../scratch/checkpoints/kaggle_cmr_supervised
+device: cuda
+seed: 0
+split_seed: 42  # the VAE's training and validation subjects, less those without la_4ch
+
+data:
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/train
+  # Views dropped from the input, as in the VAE's training.
+  view_drop_probability: 0.3
+  heldout_views: [la_4ch]
+  # Never in the input, and never setting its normalisation. Subjects without
+  # it are skipped.
+  target_view: la_4ch
+  batch_size: 2
+  num_workers: 8
+
+model:
+  type: supervised
+  # As kaggle_cmr.yaml, whose direct predictor this is.
+  n_layers: 8
+  n_filters: 64
+  blocks_per_layer: 1
+  downsampling: auto
+  scale_initialisation: false
+  checkpointed: true
+
+likelihood:
+  # Only weights the views in the encoder input (sigma_meas and init_sigma
+  # times relative_std), as in kaggle_cmr.yaml. Nothing here is learned.
+  noise: global
+  learn_noise: true
+  init_sigma: 0.05
+  relative_std:
+    la_2ch: 4
+  noise_lr: 0.01
+  min_sigma: 0.001
+
+train:
+  lr: 3.0e-4
+  lr_warmup_steps: 100
+  grad_batches: 4
+  clip: 1.0
+  max_epochs: 1000
+  # Under the SLURM time limit (1-8 in slurm/train.sh), so the job stops
+  # cleanly and --resume carries on.
+  max_hours: 30
+  patience: 50
+  plateau_patience: 20
+  plateau_factor: 0.1
+  # The la_4ch mean squared error per validation subject.
+  monitor: val/target_mse
+  image_every: 5
+  amp: true
+
+wandb:
+  project: mrisr-vae
+  mode: online
+
+# mrisr-predict --config only (sbatch slurm/predict.sh <this config>).
+predict:
+  checkpoint: best
+  out_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  split: all
+  frame: 0
+  # The baseline has no posterior: direct only.
+  method: direct
+  n_samples: 0
+  save_samples: false
+
+# mrisr-evaluate --config only (sbatch slurm/evaluate.sh <this config>).
+# As kaggle_cmr.yaml's; the baseline has no posterior, so no samples.
+evaluate:
+  checkpoint: best
+  out_dir: ../scratch/checkpoints/kaggle_cmr_supervised/evaluation_test_best
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  conditioning_views: [all, sa, la_2ch]
+  frame: null
+  n_samples: 0
+  seed: 0
+  save_predictions: false

@@ -1,0 +1,112 @@
+# Ladder VAE with one learned noise level shared by all views.
+# Ladder VAE on the Kaggle CMR training set. Options and defaults: see
+# DEFAULTS in src/mrisr_vae/train.py. Paths are relative to the repository root.
+
+geometry: configs/kaggle_cmr_geometry.yaml
+checkpoint_dir: ../scratch/checkpoints/kaggle_cmr
+device: cuda
+seed: 0
+split_seed: 42  # the same validation subjects as diffusion-priors
+
+data:
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/train
+  # Not used by the global noise model (see likelihood below).
+  view_drop_probability: 0.3
+  # Never loaded by training or validation: the ground truth for
+  # mrisr-evaluate and for a network trained to predict it directly.
+  # mrisr-train refuses to start if one is also in the geometry's VIEWS.
+  heldout_views: [la_4ch]
+  # Set from tests/memory-probe.sh
+  batch_size: 2
+  num_workers: 8
+
+model:
+  n_layers: 8
+  z_dim: 64
+  # Set from tests/memory-probe.sh
+  n_filters: 64
+  blocks_per_layer: 1
+  # auto: as COSDD's get_models, from the latent size (83 -> 5 halvings, top
+  # latent 3^3 of the padded 96^3). Or explicit per layer, e.g. [0, 1, 0, 1, 0, 1, 0, 1].
+  downsampling: auto
+  scale_initialisation: false
+  checkpointed: true
+  # A UNet trained alongside to predict E[x | y] in one pass (COSDD's direct
+  # denoiser). Trained after the VAE's graph is freed, so it adds time per
+  # step but peak memory is the larger of the two networks', not their sum.
+  direct_predictor: true
+
+likelihood:
+  # One learned sigma for every view, in normalised units (the data have std
+  # 0.8 inside the latent). The long-axis view gets 4x that, so per voxel its
+  # residuals count 1/16 as much: it is less well aligned with the short-axis
+  # stack. Views not listed get 1.
+  noise: global
+  learn_noise: true
+  init_sigma: 0.05
+  relative_std:
+    la_2ch: 4
+  noise_lr: 0.01
+  min_sigma: 0.001
+
+train:
+  lr: 3.0e-4
+  lr_warmup_steps: 100
+  # About 25 epochs (315 batches / grad_batches 4 = ~79 steps per epoch).
+  kl_warmup_steps: 2000
+  grad_batches: 4
+  clip: 1.0
+  # Raise (e.g. 0.01) if the per-layer KL in wandb shows collapsed layers.
+  free_bits: 0.0
+  free_bits_epochs: 20
+  max_epochs: 1000
+  # Under the SLURM time limit, so the job stops cleanly and --resume carries on.
+  max_hours: 100
+  patience: 50
+  plateau_patience: 20
+  plateau_factor: 0.1
+  monitor: val/nelbo
+  image_every: 5
+  amp: true
+
+wandb:
+  project: mrisr-vae
+  mode: online
+
+# mrisr-predict --config only (sbatch slurm/predict.sh <this config>).
+predict:
+  # best: lowest val/nelbo (epoch 295). last: epoch 345, whose direct
+  # predictor was reinitialised on resume at epoch 317.
+  checkpoint: best
+  out_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  # all: every subject of data_dir. val/train: the split of data_dir by split_seed.
+  split: all
+  # The frame to super-resolve in every subject; subjects without it are
+  # skipped and listed at the end of the log. null: a frame fixed per subject
+  # (the validation frame).
+  frame: 0
+  # direct, sampling or both
+  method: sampling
+  n_samples: 64
+  save_samples: false
+
+# mrisr-evaluate --config only (sbatch slurm/evaluate.sh <this config>).
+# The same subjects, frames and conditioning sets as kaggle_cmr_direct.yaml
+# and kaggle_cmr_supervised.yaml, so their metrics.csv files compare row by row.
+evaluate:
+  checkpoint: best
+  out_dir: ../scratch/checkpoints/kaggle_cmr/evaluation_test_best
+  # The test set, which no model has seen (the supervised baseline was
+  # early-stopped on the validation subjects' la_4ch): all its subjects.
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+  conditioning_views: [all, sa, la_2ch]
+  # null: a frame fixed per subject, the same for every model.
+  frame: null
+  # ~13% relative error on the per-voxel std behind spearman_std_error.
+  n_samples: 32
+  seed: 0
+  save_predictions: false
+  # Only the samples: their mean is scored and their spread is the std. The
+  # direct predictor is evaluated with kaggle_cmr_direct.yaml.
+  direct: false

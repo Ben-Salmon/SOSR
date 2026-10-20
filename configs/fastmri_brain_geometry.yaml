@@ -1,0 +1,18 @@
+# Copy of diffusion-priors/latent_image_geometry/kaggle_cmr_train.yaml, so that
+# the two models super-resolve onto the same grid.
+#
+# SU per vox:  [0.6875 0.6875 5.    ]
+# Lowest coords su:  [ -94.21507035 -100.29713317  -46.59431439]
+# Highest coords su:  [ 94.64871746 108.07604572  32.06574384]
+# Size su:  [188.86378782 208.37317889  78.66005823]
+
+
+# The only views training loads. la_4ch is held out for evaluation
+# (data: heldout_views in kaggle_cmr.yaml) and must stay out of this list.
+VIEWS: ["ax"]
+SCALE_FACTOR: 1.0
+RAW_SU_PER_LVOX: 0.6875
+# 150 su / 1.8 = 83 voxels per axis. The Ladder VAE pads them to a multiple of
+# 2^(downsampling steps), 96 for four; 144 su (80 voxels) would avoid that.
+x_size_su: [190, 200, 80]
+X_MIN_COORDS_SU: [-95, -100, -40]
