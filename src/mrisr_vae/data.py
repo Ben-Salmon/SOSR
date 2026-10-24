@@ -22,6 +22,7 @@ from .geometry import LatentGeometry
 
 # Views are normalised jointly to this standard deviation inside the latent,
 # as in diffusion-priors.
+# TODO: This wasn't necessary. If retraining, remove
 NORMALISED_STD = 0.8
 
 
@@ -108,6 +109,14 @@ def crop_y(
     mask = inside.reshape(grid.shape[1:])  # [X, Y, Z]
     start = [int(y_min_coords_vox[d]) for d in range(3)]
     return cropped_y, mask, start
+
+
+def view_geometry(params: dict) -> dict:
+    r"""A view's acquired grid as the forward model sees it: `vox_to_mm_affine`
+    (with any rigid correction), `mm_per_vox`, `kernel_size_mm` (the slice
+    thickness on axis 2) and the uncropped `size_vox`, as float64 tensors."""
+    keys = ("vox_to_mm_affine", "mm_per_vox", "kernel_size_mm", "size_vox")
+    return {key: torch.as_tensor(params[key]).to(torch.float64) for key in keys}
 
 
 class MeanStdTracker:
@@ -408,6 +417,9 @@ class CMRObservationDataset(Dataset):
                 "crop_start": starts[view],
                 "image_shape": tuple(int(s) for s in images[view].shape[:3]),
                 "image_affine": torch.as_tensor(images[view].affine),
+                # The whole acquired grid, not the crop: e.g. where a short-axis
+                # stack reaches (`evaluate.stack_region`).
+                "geometry": view_geometry(observation[view]),
             }
         if not any(d["input"] for d in item_views.values()):
             return None

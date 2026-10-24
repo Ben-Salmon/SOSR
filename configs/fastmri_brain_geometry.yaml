@@ -10,9 +10,7 @@
 # The only views training loads. la_4ch is held out for evaluation
 # (data: heldout_views in kaggle_cmr.yaml) and must stay out of this list.
 VIEWS: ["ax"]
-SCALE_FACTOR: 1.0
-RAW_SU_PER_LVOX: 0.6875
-# 150 su / 1.8 = 83 voxels per axis. The Ladder VAE pads them to a multiple of
-# 2^(downsampling steps), 96 for four; 144 su (80 voxels) would avoid that.
-x_size_su: [190, 200, 80]
-X_MIN_COORDS_SU: [-95, -100, -40]
+SCALE_FACTOR: 1
+RAW_SU_PER_LVOX: 0.75
+x_size_su: [150, 150, 80]
+X_MIN_COORDS_SU: [-75, -75, -40]

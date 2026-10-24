@@ -169,6 +169,11 @@ DEFAULTS = {
         # Score the direct predictor, if the model has one. False: the samples
         # only, so every metric is of the samples behind the std.
         "direct": True,
+        # A view group, e.g. sa: score only the held-out voxels inside the
+        # tallest stack of that group (highest index breaking ties), the same
+        # voxels whatever the conditioning set. None: wherever the held-out
+        # view's forward model is supported.
+        "region": None,
     },
 }
 

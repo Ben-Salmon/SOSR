@@ -1,6 +1,7 @@
 r"""Held-out-view evaluation, end to end on a synthetic subject. CPU only.
 
-Here the model is trained on sa_1 only and la_2ch plays the held-out view.
+Here the model is mostly trained on sa_1 only and la_2ch plays the held-out
+view; the scored-region tests hold out la_4ch, as the CMR configs do.
 """
 
 import copy
@@ -11,14 +12,15 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from nibabel.affines import apply_affine
 
 from mrisr_vae import evaluate
-from mrisr_vae.evaluate import resolve_conditioning
+from mrisr_vae.evaluate import region_stack, resolve_conditioning, stack_height_mm, stack_region
 from mrisr_vae.metrics import score_directory
 from mrisr_vae.model import build_model
 from mrisr_vae.train import DEFAULTS, check_heldout_views, check_relative_std
 
-from synthetic import GEOMETRY_CONFIG, geometry, write_subject
+from synthetic import GEOMETRY_CONFIG, VIEW_GEOMETRY, geometry, make_item, write_subject
 
 
 def small_config(data_dir, heldout_views=("la_2ch",)):
@@ -234,3 +236,98 @@ def test_direct_can_be_left_out(tmp_path):
     # Nothing left to score.
     with pytest.raises(SystemExit):
         evaluate.main([*common, "--out_dir", str(tmp_path / "nothing"), "--n_samples", "0", "--no-direct"])
+
+
+def heldout_z_mm(item, geom, view="la_4ch"):
+    r"""z (mm; mm_to_su is the identity) of each voxel centre of `view`'s crop."""
+    centres = item["views"][view]["op"]["y_centres_lvox"].to(torch.float64)
+    affine = geom.lvox_to_su_affine.to(torch.float64)
+    return (centres @ affine[:3, :3].T + affine[:3, 3])[..., 2]
+
+
+def test_stack_region_is_the_stack_through_plane_extent():
+    geom = geometry(views=["sa_2", "la_2ch"])
+    item = make_item(geom, views=("sa_2", "la_4ch"))
+    z = heldout_z_mm(item, geom)
+    region = stack_region(item, "sa_2", "la_4ch", geom)
+    assert region.shape == item["views"]["la_4ch"]["op"]["row_mask"].shape
+    # Slices at z = -14, -8, -2 mm, 6 mm thick: from -17 to 1 mm, the gaps
+    # between slices included. In-plane the stack covers the whole latent.
+    assert torch.equal(region, (z >= -17) & (z <= 1))
+    assert region.any() and not region.all()
+    # Half the slice thickness beyond the end slices, not half the spacing.
+    item["views"]["sa_2"]["geometry"]["kernel_size_mm"] = torch.tensor([1.5, 1.5, 9.0], dtype=torch.float64)
+    assert torch.equal(stack_region(item, "sa_2", "la_4ch", geom), (z >= -18.5) & (z <= 2.5))
+
+
+def test_region_stack_is_the_tallest_the_latest_breaking_ties():
+    geom = geometry(views=["sa_1", "sa_2", "la_2ch"])
+    item = make_item(geom, views=("sa_1", "sa_2", "la_2ch"))
+    assert stack_height_mm(item["views"]["sa_1"]["geometry"]) == pytest.approx(54.0)  # 9 slices of 6 mm
+    assert stack_height_mm(item["views"]["sa_2"]["geometry"]) == pytest.approx(18.0)
+    assert region_stack(item, "sa", geom.views) == "sa_1"
+    # Only the views given are candidates, e.g. the ones the model was trained on.
+    assert region_stack(item, "sa", ["sa_2", "la_2ch"]) == "sa_2"
+    assert region_stack(item, "sa", ["la_2ch"]) is None
+    # Equal heights: the highest index, compared as a number.
+    for view in ("sa_3", "sa_10"):
+        item["views"][view] = copy.deepcopy(item["views"]["sa_2"])
+    assert region_stack(item, "sa", ["sa_2", "sa_3"]) == "sa_3"
+    assert region_stack(item, "sa", ["sa_2", "sa_3", "sa_10"]) == "sa_10"
+
+
+def test_evaluate_scores_only_inside_the_tallest_shortaxis_stack(tmp_path):
+    data_dir = tmp_path / "data"
+    # Trained on sa_1 and la_2ch, la_4ch held out; sa_1 covers only the
+    # lower part of the latent, from z = -17 to 1 mm.
+    subject = write_subject(
+        data_dir, views=("sa_1", "la_2ch", "la_4ch"), frames=(5, 3, 4), view_geometry={"sa_1": VIEW_GEOMETRY["sa_2"]}
+    )
+    checkpoint = tmp_path / "model.pt"
+    config = small_config(data_dir, heldout_views=("la_4ch",))
+    torch.manual_seed(0)
+    model = build_model(config, geometry())
+    torch.save({"model": model.state_dict(), "config": config, "geometry_config": dict(GEOMETRY_CONFIG)}, checkpoint)
+    common = [
+        "--checkpoint", str(checkpoint), "--subjects", subject.name, "--conditioning_views", "all", "sa", "la_2ch",
+        "--n_samples", "2", "--save_predictions", "--device", "cpu", "--num_workers", "0",
+    ]
+
+    def run(name, *options):
+        out_dir = tmp_path / name
+        evaluate.main([*common, "--out_dir", str(out_dir), *options])
+        return out_dir, read_rows(out_dir)
+
+    def mask(out_dir, conditioning):
+        return nib.load(str(out_dir / conditioning / subject.name / "la_4ch_mask.nii.gz")).get_fdata() > 0
+
+    whole_dir, whole = run("whole")
+    region_dir, region = run("region", "--region", "sa")
+    assert [row["conditioning"] for row in region] == ["all", "sa", "la_2ch"]
+    assert all(row["region_stack"] == "sa_1" for row in region)
+    assert "region_stack" not in whole[0]
+    # The same voxels for every conditioning set, even la_2ch alone, which
+    # does not see sa_1: fewer than on the whole latent, all among them.
+    n_voxels = {int(row["n_voxels"]) for row in region}
+    assert len(n_voxels) == 1 and 0 < min(n_voxels) < int(whole[0]["n_voxels"])
+    scored = mask(region_dir, "all")
+    assert scored.sum() == min(n_voxels)
+    assert np.array_equal(scored, mask(region_dir, "sa")) and np.array_equal(scored, mask(region_dir, "la_2ch"))
+    whole_mask = mask(whole_dir, "all")
+    assert not np.any(scored & ~whole_mask)
+    # In mm: the scored voxels lie within the stack; the whole latent reaches above it.
+    affine = nib.load(str(subject / "la_4ch.nii.gz")).affine
+    z = apply_affine(affine, np.argwhere(scored))[:, 2]
+    assert z.min() >= -17 and z.max() <= 1
+    assert apply_affine(affine, np.argwhere(whole_mask))[:, 2].max() > 1
+    # mrisr-score, on the saved mask, gives the same scores.
+    scores = [s for s in score_directory(region_dir, "sample_mean") if s["conditioning"] == "all"]
+    assert scores[0]["mse"] == pytest.approx(float(region[0]["mse_sample_mean"]), rel=1e-3)
+    assert scores[0]["psnr"] == pytest.approx(float(region[0]["psnr_sample_mean"]), rel=1e-3)
+
+    # none: the whole latent again.
+    _, none = run("none", "--region", "none")
+    assert none[0]["n_voxels"] == whole[0]["n_voxels"] and none[0]["mse_sample"] == whole[0]["mse_sample"]
+    # A group of no view the model was trained on.
+    with pytest.raises(SystemExit):
+        run("bad", "--region", "ax")

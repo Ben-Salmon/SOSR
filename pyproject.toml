@@ -22,6 +22,7 @@ mrisr-train = "mrisr_vae.train:main"
 mrisr-predict = "mrisr_vae.predict:main"
 mrisr-evaluate = "mrisr_vae.evaluate:main"
 mrisr-score = "mrisr_vae.metrics:main"
+mrisr-baselines = "mrisr_vae.baselines:main"
 
 [build-system]
 requires = ["uv_build>=0.12.21,<0.13.0"]

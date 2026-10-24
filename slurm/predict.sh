@@ -4,9 +4,9 @@
 #SBATCH -p gpuL
 #SBATCH -n 1
 #SBATCH -c 4
-#SBATCH -t 0-4
+#SBATCH -t 0-1
 #SBATCH -G 1
-#SBATCH --mem=32G
+#SBATCH --mem=8G
 
 # Submit from the repo root: sbatch slurm/predict.sh <config> [mrisr-predict options]
 # e.g. sbatch slurm/predict.sh configs/kaggle_cmr.yaml --max_subjects 2

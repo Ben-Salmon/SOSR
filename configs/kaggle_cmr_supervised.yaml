@@ -92,3 +92,7 @@ evaluate:
   n_samples: 0
   seed: 0
   save_predictions: false
+  # Score la_4ch only inside the tallest short-axis stack (highest index
+  # breaking ties): the atria above it are in no training view's data. The
+  # same voxels for every model and conditioning set.
+  region: sa

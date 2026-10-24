@@ -7,6 +7,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
+from mrisr_vae.data import view_geometry as data_view_geometry
 from mrisr_vae.forward_model import BatchOperator, build_view_operator
 from mrisr_vae.geometry import LatentGeometry
 
@@ -24,6 +25,12 @@ GEOMETRY_CONFIG = {
 VIEW_GEOMETRY = {
     "sa_1": ((36, 36, 9), [1.5, 1.5, 6.0], None, [0.0, 0.0, 0.0]),
     "la_2ch": ((36, 36, 1), [1.5, 1.5, 6.0], (30, 20, 10), [1.0, -2.0, 0.5]),
+    # A stack over the lower part of the latent only: slices at z = -14, -8,
+    # -2 mm, so from z = -17 to 1 mm with 6 mm slices.
+    "sa_2": ((36, 36, 3), [1.5, 1.5, 6.0], None, [0.0, 0.0, -8.0]),
+    # A long-axis slice whose second image axis runs along z, through the
+    # whole latent, as la_4ch runs from apex to atria: z = (j - 17.5) * 1.5 mm.
+    "la_4ch": ((36, 36, 1), [1.5, 1.5, 6.0], (90, 0, 15), [0.5, 1.0, 0.0]),
 }
 
 
@@ -50,8 +57,9 @@ def grid_affine(shape, spacing, axes, centre):
     return affine
 
 
-def view_params(view):
-    shape, spacing, angles, centre = VIEW_GEOMETRY[view]
+def view_params(view, view_geometry=None):
+    r"""`view_geometry` overrides VIEW_GEOMETRY, view by view."""
+    shape, spacing, angles, centre = {**VIEW_GEOMETRY, **(view_geometry or {})}[view]
     axes = np.eye(3) if angles is None else rotation(*angles)
     return {
         "vox_to_mm_affine": torch.from_numpy(grid_affine(shape, spacing, axes, centre)),
@@ -92,7 +100,13 @@ def make_item(geom: LatentGeometry, views=("sa_1", "la_2ch"), x_true=None, seed=
         else:
             with torch.no_grad():
                 y = BatchOperator([{view: op}], geom.size_lvox)(x_true)[0][0] + noise
-        item_views[view] = {"y": y, "sigma_meas": sigma, "sigma_extra": sigma, "op": op}
+        item_views[view] = {
+            "y": y,
+            "sigma_meas": sigma,
+            "sigma_extra": sigma,
+            "op": op,
+            "geometry": data_view_geometry(observation[view]),
+        }
     return {
         "subject": f"synthetic_{seed}",
         "frame": 0,
@@ -111,19 +125,22 @@ def write_subject(
     seed: int = 0,
     sa_correction=None,
     record_correction=True,
+    view_geometry=None,
 ) -> Path:
     r"""A subject directory as the dataset expects it: one NIfTI per view
-    (X, Y, Z, T), registration_params.pickle, and a noise level for sa_1."""
+    (X, Y, Z, T), registration_params.pickle, and a noise level for sa_1.
+    `view_geometry` overrides VIEW_GEOMETRY, view by view."""
     subject = Path(root) / name
     subject.mkdir(parents=True)
     rng = np.random.default_rng(seed)
     params = {"mm_to_su_affine": torch.eye(4, dtype=torch.float64)}
     for view, n_frames in zip(views, frames):
-        shape = VIEW_GEOMETRY[view][0]
+        view_param = view_params(view, view_geometry)
+        shape = tuple(int(s) for s in view_param["size_vox"])
         data = (100 + 20 * rng.standard_normal((*shape, n_frames))).astype(np.float32)
-        nifti = nib.Nifti1Image(data, affine=view_params(view)["vox_to_mm_affine"].numpy())
+        nifti = nib.Nifti1Image(data, affine=view_param["vox_to_mm_affine"].numpy())
         nib.save(nifti, str(subject / f"{view}.nii.gz"))
-        params[view] = {k: v for k, v in view_params(view).items() if k != "size_vox"}
+        params[view] = {k: v for k, v in view_param.items() if k != "size_vox"}
     torch.save(torch.tensor(2.0), subject / "sa_1_noise_std.pt")
     if sa_correction is not None:
         np.save(subject / "sa_1_affine_correction.npy", sa_correction)

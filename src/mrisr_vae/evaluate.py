@@ -6,8 +6,8 @@ r"""Scores a trained VAE on views it never saw: the config's `heldout_views`.
 
 With --config, the config's `evaluate` section (see `train.DEFAULTS`) sets the
 checkpoint (best or last, in its checkpoint_dir), out_dir, data_dir, split,
-conditioning_views, frame, n_samples, seed, save_predictions and direct; options given
-on the command line override it. Posterior samples are drawn with the random
+conditioning_views, frame, n_samples, seed, save_predictions, direct and region; options
+given on the command line override it. Posterior samples are drawn with the random
 seed reset per subject and conditioning set, from `seed` and their names, so
 a subject's scores do not depend on which other subjects are evaluated.
 
@@ -18,13 +18,25 @@ through the held-out view's forward model. The prediction is scored against
 the held-out view, in raw intensities, on the voxels that forward model
 supports (see `metrics` for mse, psnr and ssim).
 
+With `region` (e.g. `sa`), only on those of them inside the subject's tallest
+stack of that view group, of the views the model was trained on, the highest
+index (the most recent) breaking ties: within its in-plane field of view, and
+from half a slice thickness below its first slice to half a thickness above
+its last, gaps between slices included. Elsewhere, e.g. the atria above a
+short-axis stack, no training view has data, so a model trained without the
+held-out view has nothing to go on there. The region depends on the stack's
+geometry only, so it is the same for every model and conditioning set, even
+those without the stack. Subjects without such a stack, or with no held-out
+voxel inside it, are skipped and listed.
+
 Conditioning sets: each argument of --conditioning_views is `all` (every view
 the model was trained on), or a comma-separated list of views or view groups,
 e.g. `sa` (every short-axis stack), `la_2ch`, or `sa,la_2ch`. Every set is
 evaluated on the same frame of each subject.
 
 Writes <out_dir>/metrics.csv, one row per subject, held-out view and
-conditioning set, with each metric for:
+conditioning set, with `n_voxels` scored (and, with `region`, the
+`region_stack` bounding them), and each metric for:
 
     sample       each posterior sample, averaged over the samples
     sample_mean  the mean of the samples (the MMSE estimate)
@@ -62,6 +74,8 @@ import argparse
 import csv
 import os
 import zlib
+from collections.abc import Callable
+from typing import NamedTuple
 
 import nibabel as nib
 import numpy as np
@@ -70,7 +84,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .data import NORMALISED_STD, CMRObservationDataset, collate, split_subjects
-from .forward_model import BatchOperator
+from .forward_model import BatchOperator, apply_affine, invert_affine
 from .geometry import LatentGeometry
 from .likelihood import view_group
 from .metrics import masked_metrics, masked_spearman
@@ -93,37 +107,151 @@ def conditioning_label(spec: str) -> str:
     return spec.replace(",", "+")
 
 
-@torch.no_grad()
-def evaluate_item(
-    model: MRIVAE, item: dict, view: str, n_samples: int, conditioning_views, amp: bool = True, direct: bool = True
-):
-    r"""Predictions of the held-out `view` of `item` from `conditioning_views`.
+def stack_height_mm(geometry: dict) -> float:
+    r"""Through-plane extent of a stack: from half a slice thickness below its
+    first slice centre to half a thickness above its last."""
+    n_slices = int(geometry["size_vox"][2])
+    spacing = abs(float(geometry["mm_per_vox"].flatten()[-1]))
+    thickness = float(geometry["kernel_size_mm"].flatten()[-1])
+    return (n_slices - 1) * spacing + thickness
 
-    Returns the metrics row, the predictions, the projected samples' per-voxel
-    standard deviation (None with fewer than 2 samples) and the target (raw
-    intensities, on the view's cropped grid, zero off the mask), and the mask;
-    or None if the item lacks the view or every conditioning view.
+
+def _view_index(view: str):
+    suffix = view.rsplit("_", 1)[-1]
+    return (int(suffix) if suffix.isdigit() else -1, view)
+
+
+def region_stack(item: dict, group: str, views) -> str | None:
+    r"""The tallest stack of `group` (e.g. `sa`) among the item's `views`, the
+    highest index (the most recent) breaking ties; None if it has none."""
+    candidates = [view for view in item["views"] if view in views and view_group(view) == group]
+    if not candidates:
+        return None
+    heights = {view: stack_height_mm(item["views"][view]["geometry"]) for view in candidates}
+    tallest = max(heights.values())
+    return max((view for view in candidates if heights[view] >= tallest - 1e-3), key=_view_index)
+
+
+def lvox_to_stack_vox(item: dict, stack: str, geometry: LatentGeometry) -> torch.Tensor:
+    r"""The affine (float64) from latent voxels to `stack`'s voxels, through the
+    stack's registered geometry, as the forward model sees it."""
+    g = item["views"][stack]["geometry"]
+    mm_to_su = torch.as_tensor(item["mm_to_su_affine"]).to(torch.float64)
+    vox_to_su = mm_to_su @ g["vox_to_mm_affine"]
+    return invert_affine(vox_to_su) @ geometry.lvox_to_su_affine.to(torch.float64)
+
+
+def inside_stack(vox: torch.Tensor, stack_geometry: dict) -> torch.Tensor:
+    r"""Whether each point (..., 3), in the stack's voxels, lies inside its
+    volume: its in-plane field of view, and through-plane from half a slice
+    thickness below its first slice to half a thickness above its last. Gaps
+    between slices count as inside."""
+    g = stack_geometry
+    # Half a voxel in-plane; half a slice thickness through-plane, in voxels.
+    thickness_vox = float(g["kernel_size_mm"].flatten()[-1]) / abs(float(g["mm_per_vox"].flatten()[-1]))
+    half = torch.tensor([0.5, 0.5, 0.5 * thickness_vox], dtype=torch.float64)
+    lo, hi = -half, g["size_vox"] - 1 + half
+    return ((vox >= lo) & (vox <= hi)).all(dim=-1)
+
+
+def stack_region(item: dict, stack: str, view: str, geometry: LatentGeometry) -> torch.Tensor:
+    r"""Whether each voxel of `view` (on its cropped grid) has its centre inside
+    `stack`'s volume (see `inside_stack`)."""
+    lvox_to_vox = lvox_to_stack_vox(item, stack, geometry)
+    centres = item["views"][view]["op"]["y_centres_lvox"].to(torch.float64)  # (n0, n1, n2, 3)
+    vox = apply_affine(lvox_to_vox, centres.reshape(-1, 3).T).T.reshape(centres.shape)
+    return inside_stack(vox, item["views"][stack]["geometry"])
+
+
+class HeldoutProjection(NamedTuple):
+    r"""What scoring a prediction of a held-out view needs (`heldout_projection`)."""
+
+    project: Callable  # (1, 1, D, H, W) normalised latent -> the view's voxels, raw, zero off the mask
+    target: torch.Tensor  # the held-out view on its cropped grid, raw intensities
+    mask: torch.Tensor  # 1 on the scored voxels
+    stack: str | None  # the stack bounding the scored region, if any
+
+
+def heldout_projection(
+    item: dict,
+    view: str,
+    geometry: LatentGeometry,
+    lanczos_a: int = 3,
+    region: str | None = None,
+    device="cpu",
+) -> HeldoutProjection | None:
+    r"""The held-out `view`'s forward model, scored voxels and target, the same
+    for every method scored on it.
+
+    Scored on the voxels of `view` the forward model supports; with `region`
+    (a view group, e.g. `sa`), only those inside the tallest of the item's
+    stacks of that group in the geometry's views (`region_stack`,
+    `stack_region`). None if the item lacks the view or no voxel is left.
     """
-    conditioning = {v: d for v, d in item["views"].items() if v in conditioning_views}
-    if view not in item["views"] or not conditioning:
+    if view not in item["views"]:
         return None
     heldout = item["views"][view]
-    A = BatchOperator([{view: heldout["op"]}], model.geometry.size_lvox, lanczos_a=model.lanczos_a).to(model.device)
+    A = BatchOperator([{view: heldout["op"]}], geometry.size_lvox, lanczos_a=lanczos_a).to(device)
     mask = A.op(0, view).row_mask
-    n = mask.sum()
-    if n == 0:
+    stack = None
+    if region is not None:
+        stack = region_stack(item, region, geometry.views)
+        if stack is None:
+            tqdm.write(f"{item['subject']}: no {region} stack to bound the scored region; skipped")
+            return None
+        mask = mask * stack_region(item, stack, view, geometry).to(mask)
+    if mask.sum() == 0:
+        if region is not None:
+            tqdm.write(f"{item['subject']}: no {view} voxel inside {stack}; skipped")
         return None
     scale = item["norm_std"] / NORMALISED_STD
 
     def raw(values):
         return values * scale + item["norm_mean"]
 
-    target = raw(heldout["y"].to(model.device)[0, 0])
-    cond_item = {**item, "views": conditioning}
-
-    def project(x):  # (1, 1, D, H, W) -> the held-out view's voxels, raw intensities, zero off the mask
+    def project(x):
         with torch.autocast(device_type=x.device.type, enabled=False):
             return raw(A(x.float())[0][0][0, 0]) * mask
+
+    target = raw(heldout["y"].to(device)[0, 0])
+    return HeldoutProjection(project, target, mask, stack)
+
+
+@torch.no_grad()
+def evaluate_item(
+    model: MRIVAE,
+    item: dict,
+    view: str,
+    n_samples: int,
+    conditioning_views,
+    amp: bool = True,
+    direct: bool = True,
+    region: str | None = None,
+):
+    r"""Predictions of the held-out `view` of `item` from `conditioning_views`.
+
+    Scored on the voxels of `view` the forward model supports; with `region`
+    (a view group, e.g. `sa`), only those inside the tallest of the item's
+    stacks of that group that the model was trained on (`region_stack`,
+    `stack_region`), whichever views it is conditioned on.
+
+    Returns the metrics row, the predictions, the projected samples' per-voxel
+    standard deviation (None with fewer than 2 samples) and the target (raw
+    intensities, on the view's cropped grid, zero off the mask), and the mask;
+    or None if the item lacks the view or every conditioning view, or no voxel
+    is left to score.
+    """
+    conditioning = {v: d for v, d in item["views"].items() if v in conditioning_views}
+    if view not in item["views"] or not conditioning:
+        return None
+    projection = heldout_projection(
+        item, view, model.geometry, lanczos_a=model.lanczos_a, region=region, device=model.device
+    )
+    if projection is None:
+        return None
+    project, target, mask, stack = projection
+    n = mask.sum()
+    cond_item = {**item, "views": conditioning}
 
     row = {
         "subject": item["subject"],
@@ -131,6 +259,7 @@ def evaluate_item(
         "view": view,
         "conditioning_views": " ".join(conditioning),
         "n_voxels": int(n),
+        **({"region_stack": stack} if stack is not None else {}),
         "norm_mean": item["norm_mean"],
         "norm_std": item["norm_std"],
     }
@@ -171,16 +300,21 @@ def on_image_grid(values: torch.Tensor, heldout: dict) -> np.ndarray:
     return full
 
 
-def save_predictions(out_dir: str, item: dict, view: str, predictions: dict, target, mask, std=None):
+def save_on_image_grid(out_dir: str, item: dict, view: str, values: torch.Tensor, name: str):
+    r"""Writes values on `view`'s cropped grid as <out_dir>/<view>_<name>.nii.gz,
+    on the view's own image grid, with the frame in the header's toffset."""
     heldout = item["views"][view]
-    affine = heldout["image_affine"].numpy()
+    nifti = nib.Nifti1Image(on_image_grid(values, heldout), affine=heldout["image_affine"].numpy())
+    if item["frame"] is not None:
+        nifti.header["toffset"] = item["frame"]
+    nib.save(nifti, os.path.join(out_dir, f"{view}_{name}.nii.gz"))
+
+
+def save_predictions(out_dir: str, item: dict, view: str, predictions: dict, target, mask, std=None):
     os.makedirs(out_dir, exist_ok=True)
 
     def save(values, name):
-        nifti = nib.Nifti1Image(on_image_grid(values, heldout), affine=affine)
-        if item["frame"] is not None:
-            nifti.header["toffset"] = item["frame"]
-        nib.save(nifti, os.path.join(out_dir, f"{view}_{name}.nii.gz"))
+        save_on_image_grid(out_dir, item, view, values, name)
 
     save(target, "target")
     for name, values in predictions.items():
@@ -215,6 +349,10 @@ def main(argv=None):
         action=argparse.BooleanOptionalAction,
         help="Score the direct predictor, if the model has one (--no-direct: the samples only). Default: on",
     )
+    parser.add_argument(
+        "--region",
+        help="Score only inside the tallest stack of this view group, e.g. sa; none: everywhere. Default: none",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args(argv)
@@ -222,9 +360,12 @@ def main(argv=None):
 
     # Command line, then the config's evaluate section, then its defaults.
     keys = (
-        "out_dir", "data_dir", "split", "conditioning_views", "frame", "n_samples", "seed", "save_predictions", "direct"
+        "out_dir", "data_dir", "split", "conditioning_views", "frame", "n_samples", "seed", "save_predictions",
+        "direct", "region",
     )
     options_from_config(parser, args, "evaluate", keys, out_dir_prefix="evaluation")
+    if args.region in ("none", "null"):
+        args.region = None
     print(f"Checkpoint {args.checkpoint}; writing to {args.out_dir}")
 
     device = torch.device(args.device)
@@ -255,6 +396,8 @@ def main(argv=None):
         conditioning_sets = {spec: resolve_conditioning(spec, geometry.views) for spec in args.conditioning_views}
     except ValueError as error:
         parser.error(str(error))
+    if args.region is not None and not any(view_group(v) == args.region for v in geometry.views):
+        parser.error(f"--region `{args.region}` is no group of the views the model was trained on: {geometry.views}")
 
     data_dir = args.data_dir or config["data"]["data_dir"]
     if args.subjects is not None:
@@ -297,7 +440,8 @@ def main(argv=None):
                 with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
                     torch.manual_seed(args.seed + zlib.crc32(f"{item['subject']}/{spec}".encode()))
                     result = evaluate_item(
-                        model, item, view, args.n_samples, conditioning_views, amp=amp, direct=direct
+                        model, item, view, args.n_samples, conditioning_views, amp=amp, direct=direct,
+                        region=args.region,
                     )
                 if result is None:
                     continue

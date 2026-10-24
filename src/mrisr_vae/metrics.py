@@ -4,7 +4,8 @@ r"""Masked image metrics for scoring predictions of a held-out view.
 
 Every method should be scored by this code on the same voxels: the scoring
 mask written by `mrisr-evaluate --save_predictions` (the voxels the held-out
-view's forward model supports). Predictions are compared in raw intensities.
+view's forward model supports, and with `region`, only those inside the
+bounding stack: see `evaluate`). Predictions are compared in raw intensities.
 
 - mse:  mean squared error over the mask.
 - psnr: 10 log10(L^2 / mse), with L the target's range (max - min) over the

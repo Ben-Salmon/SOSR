@@ -4,7 +4,7 @@
 #SBATCH -p gpuL
 #SBATCH -n 1
 #SBATCH -c 4
-#SBATCH -t 1-0             # 32 posterior samples x 3 conditioning sets on the test set; time 2 subjects first
+#SBATCH -t 0-1             # 32 posterior samples x 3 conditioning sets on the test set; time 2 subjects first
 #SBATCH -G 1
 #SBATCH --mem=8G
 

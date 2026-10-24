@@ -3,7 +3,7 @@
 # DEFAULTS in src/mrisr_vae/train.py. Paths are relative to the repository root.
 
 geometry: configs/fastmri_brain_geometry.yaml
-checkpoint_dir: ../scratch/checkpoints/fastmri_brain
+checkpoint_dir: ../scratch/checkpoints/fastmri_brain/
 device: cuda
 seed: 0
 split_seed: 42  # the same validation subjects as diffusion-priors
@@ -17,11 +17,11 @@ data:
   # mrisr-train refuses to start if one is also in the geometry's VIEWS.
   heldout_views: []
   # Set from tests/memory-probe.sh
-  batch_size: 2
+  batch_size: 1
   num_workers: 8
 
 model:
-  n_layers: 8
+  n_layers: 6
   z_dim: 64
   # Set from tests/memory-probe.sh
   n_filters: 64
@@ -52,7 +52,7 @@ train:
   lr_warmup_steps: 100
   # About 25 epochs (315 batches / grad_batches 4 = ~79 steps per epoch).
   kl_warmup_steps: 2000
-  grad_batches: 4
+  grad_batches: 8
   clip: 1.0
   # Raise (e.g. 0.01) if the per-layer KL in wandb shows collapsed layers.
   free_bits: 0.0
@@ -76,8 +76,8 @@ predict:
   # best: lowest val/nelbo (epoch 295). last: epoch 345, whose direct
   # predictor was reinitialised on resume at epoch 317.
   checkpoint: best
-  out_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/fastmri/nifti/test
-  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/fastmri/nifti/test
+  out_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/fastmri/for_visualisation
+  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/fastmri/for_visualisation
   # all: every subject of data_dir. val/train: the split of data_dir by split_seed.
   split: all
   # The frame to super-resolve in every subject; subjects without it are
@@ -85,23 +85,6 @@ predict:
   # (the validation frame).
   frame: 0
   # direct, sampling or both
-  method: sampling
-  n_samples: 64
+  method: direct
+  n_samples: 0
   save_samples: false
-
-# mrisr-evaluate --config only (sbatch slurm/evaluate.sh <this config>).
-# The same subjects, frames and conditioning sets as kaggle_cmr_direct.yaml
-# and kaggle_cmr_supervised.yaml, so their metrics.csv files compare row by row.
-evaluate:
-  checkpoint: best
-  out_dir: ../scratch/checkpoints/fastmri_brain/evaluation_test_best
-  # The test set, which no model has seen (the supervised baseline was
-  # early-stopped on the validation subjects' la_4ch): all its subjects.
-  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/fastmri/nifti/test
-  conditioning_views: [all]
-  # null: a frame fixed per subject, the same for every model.
-  frame: null
-  # ~13% relative error on the per-voxel std behind spearman_std_error.
-  n_samples: 32
-  seed: 0
-  save_predictions: true

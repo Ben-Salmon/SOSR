@@ -110,3 +110,7 @@ evaluate:
   # Only the samples: their mean is scored and their spread is the std. The
   # direct predictor is evaluated with kaggle_cmr_direct.yaml.
   direct: false
+  # Score la_4ch only inside the tallest short-axis stack (highest index
+  # breaking ties): the atria above it are in no training view's data. The
+  # same voxels for every model and conditioning set.
+  region: sa

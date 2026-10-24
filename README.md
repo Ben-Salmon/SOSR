@@ -111,7 +111,18 @@ is normalised from its own views alone, so nothing else leaks into the input.
 For each set it projects the super-resolved volume through the held-out view's
 forward model, and scores it in raw intensities on the voxels that forward
 model supports, with MSE, PSNR and SSIM (definitions in `metrics.py`). It
-writes `metrics.csv`. With `--save_predictions` it also writes the
+writes `metrics.csv`.
+
+The CMR configs set `evaluate: region: sa` (`--region sa`): only the
+`la_4ch` voxels inside the subject's tallest short-axis stack are scored (the
+highest index breaking ties), within its field of view and from half a slice
+thickness below its first slice to half a thickness above its last. The latent
+cube reaches above the ventricular base, but no training view images the
+atria there (`la_2ch` crosses `la_4ch` along one line only), so the VAE has no
+data for them, while the supervised baseline is trained on them. The region
+depends only on the stack's geometry, so every model and conditioning set is
+scored on the same voxels; `metrics.csv` gives their number (`n_voxels`) and
+the stack (`region_stack`). With `--save_predictions` it also writes the
 predictions, target and scoring mask on the view's own image grid, in
 `<conditioning>/<subject>/`.
 
