@@ -1,11 +1,11 @@
 #!/bin/bash --login
 #SBATCH -J mrisr-vae-evaluate
 #SBATCH -o logs/%x-%j.out   # stdout and stderr, relative to the submission directory (the repo root)
-#SBATCH -p gpuL
+#SBATCH --partition=gpuq
 #SBATCH -n 1
 #SBATCH -c 4
-#SBATCH -t 0-1             # 32 posterior samples x 3 conditioning sets on the test set; time 2 subjects first
-#SBATCH -G 1
+#SBATCH --time=00:10:00
+#SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 
 # Scores a model on the held-out view(s) (data: heldout_views) and saves the
@@ -23,9 +23,8 @@ if [ $# -lt 1 ]; then
 fi
 config=$1
 shift
-module purge
 
-srun uv run mrisr-evaluate --config "$config" "$@"
+uv run mrisr-evaluate --config "$config" "$@"
 
 # To score another method's predictions, saved beside these as
 # <conditioning>/<subject>/la_4ch_pred_<name>.nii.gz:

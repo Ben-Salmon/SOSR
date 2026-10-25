@@ -108,20 +108,25 @@ handles mixed views.
 example, `--conditioning_views all sa la_2ch` evaluates short axis plus
 `la_2ch`, short axis alone, and `la_2ch` alone, all on the same frame. Each set
 is normalised from its own views alone, so nothing else leaks into the input.
+`sa_first` conditions each subject on its lowest-numbered short-axis stack
+alone, the one stack the SMORE and interpolation baselines are given
+(`mrisr-baselines`, `slurm/baselines.sh`), so they compare like for like.
 For each set it projects the super-resolved volume through the held-out view's
 forward model, and scores it in raw intensities on the voxels that forward
 model supports, with MSE, PSNR and SSIM (definitions in `metrics.py`). It
 writes `metrics.csv`.
 
-The CMR configs set `evaluate: region: sa` (`--region sa`): only the
-`la_4ch` voxels inside the subject's tallest short-axis stack are scored (the
-highest index breaking ties), within its field of view and from half a slice
-thickness below its first slice to half a thickness above its last. The latent
+The CMR configs set `evaluate: region: sa_first` (`--region sa_first`): only
+the `la_4ch` voxels inside the subject's lowest-numbered short-axis stack are
+scored, the stack `sa_first` conditions on, within its field of view and from
+half a slice thickness below its first slice to half a thickness above its
+last. (`--region sa` takes the tallest stack instead, the highest index
+breaking ties.) The latent
 cube reaches above the ventricular base, but no training view images the
 atria there (`la_2ch` crosses `la_4ch` along one line only), so the VAE has no
 data for them, while the supervised baseline is trained on them. The region
-depends only on the stack's geometry, so every model and conditioning set is
-scored on the same voxels; `metrics.csv` gives their number (`n_voxels`) and
+depends only on which stacks the subject has and their geometry, so every
+model and conditioning set is scored on the same voxels; `metrics.csv` gives their number (`n_voxels`) and
 the stack (`region_stack`). With `--save_predictions` it also writes the
 predictions, target and scoring mask on the view's own image grid, in
 `<conditioning>/<subject>/`.
@@ -138,7 +143,7 @@ The three configs evaluate the same way, so their `metrics.csv` rows match on
   was early-stopped on the validation subjects' `la_4ch`);
 - one frame per subject, fixed by its name, so phases vary across subjects
   but not between models or runs;
-- conditioning on `all`, `sa` and `la_2ch`;
+- conditioning on `all`, `sa`, `sa_first` and `la_2ch`;
 - 32 posterior samples for the VAE, reseeded per subject and conditioning
   set from `seed`. The other two runs draw none: `kaggle_cmr_direct`'s VAE is
   `kaggle_cmr`'s, frozen, and the baseline has no posterior.

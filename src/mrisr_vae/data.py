@@ -9,6 +9,7 @@ build them in parallel, and random view dropout for training.
 import pickle
 import random
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import nibabel as nib
@@ -193,7 +194,7 @@ class CMRObservationDataset(Dataset):
 
     Each item is a dict, or None if the subject has no usable view:
 
-        subject, frame, mm_to_su_affine, norm_mean, norm_std,
+        subject, frame, mm_to_su_affine, norm_mean, norm_std, norm_views,
         views: {view: {y, sigma_meas, sigma_extra, op, input,
                        crop_start, image_shape, image_affine}} in `views` order
 
@@ -214,7 +215,10 @@ class CMRObservationDataset(Dataset):
         norm_views: The views whose voxels set the normalisation. Defaults to
             every input view. Evaluation sets it to the conditioning views,
             so that a held-out view does not leak into the input through its
-            intensities.
+            intensities. Or a function choosing them per subject from the
+            views it has (loaded, overlapping the latent, not targets), e.g.
+            its lowest-numbered short-axis stack; it must be picklable for
+            DataLoader workers. The item's `norm_views` records the choice.
         train: Random frames and view dropout. Otherwise the frame is fixed per
             subject and every view is kept.
         view_drop_probability: In training, each view is dropped from the
@@ -237,7 +241,7 @@ class CMRObservationDataset(Dataset):
         subjects: list[str] | None = None,
         extra_noise_std: dict | None = None,
         views: list[str] | None = None,
-        norm_views: list[str] | None = None,
+        norm_views: list[str] | Callable[[list[str]], list[str]] | None = None,
         train: bool = False,
         view_drop_probability: float = 0.0,
         frame: int | None = None,
@@ -257,7 +261,7 @@ class CMRObservationDataset(Dataset):
         if trained:
             raise ValueError(f"Target views {sorted(trained)} are among the views the model is shown")
         self.views += [view for view in self.target_views if view not in self.views]
-        self.norm_views = None if norm_views is None else set(norm_views)
+        self.norm_views = norm_views if norm_views is None or callable(norm_views) else set(norm_views)
         self.extra_noise_std = dict(extra_noise_std or {})
         self.train = train
         self.view_drop_probability = view_drop_probability
@@ -347,7 +351,7 @@ class CMRObservationDataset(Dataset):
         observation = {"mm_to_su_affine": mm_to_su_affine}
         crops = {}
         starts = {}
-        tracker = MeanStdTracker()
+        insides = {}
         for view, img in images.items():
             data = load_frame(img, frame)  # [X, Y, Z]
             correction_file = subject_path / f"{view}_affine_correction.npy"
@@ -378,8 +382,18 @@ class CMRObservationDataset(Dataset):
                 continue
             crops[view] = cropped
             starts[view] = start
-            if view in input_views and (self.norm_views is None or view in self.norm_views):
-                tracker.update_stats(cropped, mask=inside[None].expand_as(cropped))
+            insides[view] = inside
+
+        if callable(self.norm_views):
+            norm_views = set(self.norm_views([view for view in crops if view not in self.target_views]))
+        else:
+            norm_views = self.norm_views
+        tracker = MeanStdTracker()
+        used_for_norm = []
+        for view, cropped in crops.items():
+            if view in input_views and (norm_views is None or view in norm_views):
+                tracker.update_stats(cropped, mask=insides[view][None].expand_as(cropped))
+                used_for_norm.append(view)
 
         if not crops or tracker.N < 2:
             return None
@@ -432,6 +446,8 @@ class CMRObservationDataset(Dataset):
             "mm_to_su_affine": mm_to_su_affine,
             "norm_mean": norm_mean,
             "norm_std": norm_std,
+            # The views whose voxels set norm_mean and norm_std.
+            "norm_views": used_for_norm,
             "views": item_views,
         }
 

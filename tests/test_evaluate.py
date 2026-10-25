@@ -15,7 +15,8 @@ import yaml
 from nibabel.affines import apply_affine
 
 from mrisr_vae import evaluate
-from mrisr_vae.evaluate import region_stack, resolve_conditioning, stack_height_mm, stack_region
+from mrisr_vae.data import CMRObservationDataset
+from mrisr_vae.evaluate import norm_views_for, region_stack, resolve_conditioning, stack_height_mm, stack_region
 from mrisr_vae.metrics import score_directory
 from mrisr_vae.model import build_model
 from mrisr_vae.train import DEFAULTS, check_heldout_views, check_relative_std
@@ -127,8 +128,11 @@ def test_conditioning_sets():
     assert resolve_conditioning("sa", views) == ["sa_1", "sa_2"]
     assert resolve_conditioning("la_2ch", views) == ["la_2ch"]
     assert resolve_conditioning("la_2ch,sa_2", views) == ["sa_2", "la_2ch"]
-    with pytest.raises(ValueError):
-        resolve_conditioning("la_4ch", views)
+    # Each subject picks one of these: see test_sa_first_*.
+    assert resolve_conditioning("sa_first", views) == ["sa_1", "sa_2"]
+    for spec in ("la_4ch", "ax_first", "sa_first,la_2ch"):
+        with pytest.raises(ValueError):
+            resolve_conditioning(spec, views)
 
 
 def test_evaluate_refuses_a_trained_view(tmp_path):
@@ -274,6 +278,59 @@ def test_region_stack_is_the_tallest_the_latest_breaking_ties():
         item["views"][view] = copy.deepcopy(item["views"]["sa_2"])
     assert region_stack(item, "sa", ["sa_2", "sa_3"]) == "sa_3"
     assert region_stack(item, "sa", ["sa_2", "sa_3", "sa_10"]) == "sa_10"
+    # sa_first: the lowest number, compared as a number, whatever the heights.
+    assert region_stack(item, "sa_first", geom.views) == "sa_1"
+    assert region_stack(item, "sa_first", ["sa_3", "sa_10", "la_2ch"]) == "sa_3"
+    assert region_stack(item, "sa_first", ["la_2ch"]) is None
+
+
+def test_sa_first_normalises_from_the_lowest_numbered_stack_present(tmp_path):
+    geom = geometry(views=["sa_1", "sa_2", "la_2ch"])
+    write_subject(tmp_path / "both", views=("sa_1", "sa_2", "la_2ch"), frames=(5, 3, 4))
+    write_subject(tmp_path / "no_sa_1", views=("sa_2", "la_2ch"), frames=(3, 4))
+    norm_views = norm_views_for("sa_first", resolve_conditioning("sa_first", geom.views))
+    for data_dir, stack in ((tmp_path / "both", "sa_1"), (tmp_path / "no_sa_1", "sa_2")):
+        item = CMRObservationDataset(data_dir, geom, norm_views=norm_views, frame=1)[0]
+        alone = CMRObservationDataset(data_dir, geom, norm_views=[stack], frame=1)[0]
+        assert item["norm_views"] == [stack]
+        assert (item["norm_mean"], item["norm_std"]) == (alone["norm_mean"], alone["norm_std"])
+        assert item["norm_mean"] != CMRObservationDataset(data_dir, geom, frame=1)[0]["norm_mean"]
+
+
+def test_evaluate_conditions_and_scores_on_the_lowest_numbered_stack(tmp_path):
+    data_dir = tmp_path / "data"
+    # sa_1 covers only the lower part of the latent; sa_2, all of it, so it
+    # is the taller one.
+    subject = write_subject(
+        data_dir, views=("sa_1", "sa_2", "la_2ch", "la_4ch"), frames=(5, 3, 4, 4),
+        view_geometry={"sa_1": VIEW_GEOMETRY["sa_2"], "sa_2": VIEW_GEOMETRY["sa_1"]},
+    )
+    checkpoint = tmp_path / "model.pt"
+    config = small_config(data_dir, heldout_views=("la_4ch",))
+    geometry_config = dict(GEOMETRY_CONFIG, VIEWS=["sa_1", "sa_2", "la_2ch"])
+    torch.manual_seed(0)
+    model = build_model(config, geometry(views=geometry_config["VIEWS"]))
+    torch.save({"model": model.state_dict(), "config": config, "geometry_config": geometry_config}, checkpoint)
+
+    def run(name, region):
+        out_dir = tmp_path / name
+        evaluate.main([
+            "--checkpoint", str(checkpoint), "--subjects", subject.name, "--conditioning_views", "sa_first", "sa",
+            "--n_samples", "2", "--region", region, "--device", "cpu", "--num_workers", "0",
+            "--out_dir", str(out_dir),
+        ])
+        return {row["conditioning"]: row for row in read_rows(out_dir)}
+
+    first = run("first", "sa_first")
+    assert first["sa_first"]["conditioning_views"] == "sa_1"
+    assert first["sa"]["conditioning_views"] == "sa_1 sa_2"
+    assert float(first["sa_first"]["norm_mean"]) != pytest.approx(float(first["sa"]["norm_mean"]))
+    # The same region for both sets: sa_1, though sa_2 is taller.
+    assert {row["region_stack"] for row in first.values()} == {"sa_1"}
+    assert first["sa_first"]["n_voxels"] == first["sa"]["n_voxels"]
+    tallest = run("tallest", "sa")
+    assert {row["region_stack"] for row in tallest.values()} == {"sa_2"}
+    assert int(tallest["sa"]["n_voxels"]) > int(first["sa"]["n_voxels"])
 
 
 def test_evaluate_scores_only_inside_the_tallest_shortaxis_stack(tmp_path):

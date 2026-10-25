@@ -18,21 +18,25 @@ through the held-out view's forward model. The prediction is scored against
 the held-out view, in raw intensities, on the voxels that forward model
 supports (see `metrics` for mse, psnr and ssim).
 
-With `region` (e.g. `sa`), only on those of them inside the subject's tallest
-stack of that view group, of the views the model was trained on, the highest
-index (the most recent) breaking ties: within its in-plane field of view, and
-from half a slice thickness below its first slice to half a thickness above
-its last, gaps between slices included. Elsewhere, e.g. the atria above a
-short-axis stack, no training view has data, so a model trained without the
-held-out view has nothing to go on there. The region depends on the stack's
-geometry only, so it is the same for every model and conditioning set, even
-those without the stack. Subjects without such a stack, or with no held-out
-voxel inside it, are skipped and listed.
+With `region` (e.g. `sa`), only on those of them inside one stack of that view
+group, of the views the model was trained on: `sa`, the subject's tallest
+short-axis stack, the highest index (the most recent) breaking ties; `sa_first`,
+its lowest-numbered one, the stack the `sa_first` conditioning set gives the
+model. Inside means within the stack's in-plane field of view, and from half a
+slice thickness below its first slice to half a thickness above its last, gaps
+between slices included. Elsewhere, e.g. the atria above a short-axis stack, no
+training view has data, so a model trained without the held-out view has
+nothing to go on there. The region depends on which stacks the subject has and
+their geometry only, so it is the same for every model and conditioning set,
+even those without the stack. Subjects without such a stack, or with no
+held-out voxel inside it, are skipped and listed.
 
 Conditioning sets: each argument of --conditioning_views is `all` (every view
-the model was trained on), or a comma-separated list of views or view groups,
-e.g. `sa` (every short-axis stack), `la_2ch`, or `sa,la_2ch`. Every set is
-evaluated on the same frame of each subject.
+the model was trained on), a comma-separated list of views or view groups,
+e.g. `sa` (every short-axis stack), `la_2ch`, or `sa,la_2ch`, or a group with
+`_first`, e.g. `sa_first`: each subject's lowest-numbered short-axis stack
+alone (the only stack the SMORE and interpolation baselines are given; see
+`baselines`). Every set is evaluated on the same frame of each subject.
 
 Writes <out_dir>/metrics.csv, one row per subject, held-out view and
 conditioning set, with `n_voxels` scored (and, with `region`, the
@@ -72,6 +76,7 @@ and score them with `mrisr-score --name <name>`, which uses the same code.
 
 import argparse
 import csv
+import functools
 import os
 import zlib
 from collections.abc import Callable
@@ -92,15 +97,57 @@ from .model import MRIVAE, build_model
 from .train import options_from_config
 
 
+# `<group>_first` (e.g. `sa_first`), as a conditioning set or region: the
+# subject's lowest-numbered stack of the group.
+FIRST_SUFFIX = "_first"
+
+
+def first_group(spec: str) -> str | None:
+    r"""The group of a `<group>_first` conditioning set or region, else None."""
+    return spec[: -len(FIRST_SUFFIX)] if spec.endswith(FIRST_SUFFIX) else None
+
+
 def resolve_conditioning(spec: str, views: list[str]) -> list[str]:
-    r"""The views of a conditioning set: `all`, or comma-separated views or groups."""
+    r"""The views of a conditioning set: `all`, or comma-separated views or
+    groups. For `<group>_first`, the group's views, of which each subject is
+    given its lowest-numbered one (`norm_views_for`, `item_conditioning`)."""
     if spec == "all":
         return list(views)
+    group = first_group(spec)
+    if group is not None:
+        candidates = [view for view in views if view_group(view) == group]
+        if not candidates:
+            raise ValueError(f"`{group}` is no group of the views the model was trained on: {views}")
+        return candidates
     names = [name for name in spec.split(",") if name]
     for name in names:
         if not any(view == name or view_group(view) == name for view in views):
-            raise ValueError(f"`{name}` matches none of the views the model was trained on: {views}")
+            hint = f" (`{name}` must be a conditioning set on its own)" if first_group(name) else ""
+            raise ValueError(f"`{name}` matches none of the views the model was trained on: {views}{hint}")
     return [view for view in views if any(view == name or view_group(view) == name for name in names)]
+
+
+def lowest_numbered(candidates, available) -> list[str]:
+    r"""The lowest-numbered of `candidates` among `available`, as a list (empty if none)."""
+    present = [view for view in available if view in candidates]
+    return [min(present, key=_view_index)] if present else []
+
+
+def norm_views_for(spec: str, conditioning_views: list[str]):
+    r"""The dataset's `norm_views` for a conditioning set: its views, or for
+    `<group>_first` a (picklable) function picking each subject's
+    lowest-numbered stack of them, which alone then sets the normalisation."""
+    if first_group(spec) is not None:
+        return functools.partial(lowest_numbered, tuple(conditioning_views))
+    return conditioning_views
+
+
+def item_conditioning(spec: str, item: dict, conditioning_views: list[str]) -> list[str]:
+    r"""The views `item` is conditioned on: for `<group>_first`, the stack the
+    dataset picked (and normalised from); otherwise the set's views."""
+    if first_group(spec) is not None:
+        return list(item["norm_views"])
+    return conditioning_views
 
 
 def conditioning_label(spec: str) -> str:
@@ -121,12 +168,18 @@ def _view_index(view: str):
     return (int(suffix) if suffix.isdigit() else -1, view)
 
 
-def region_stack(item: dict, group: str, views) -> str | None:
-    r"""The tallest stack of `group` (e.g. `sa`) among the item's `views`, the
-    highest index (the most recent) breaking ties; None if it has none."""
+def region_stack(item: dict, region: str, views) -> str | None:
+    r"""The stack bounding the scored region, among the item's `views`: for a
+    group (e.g. `sa`), its tallest stack, the highest index (the most recent)
+    breaking ties; for `<group>_first` (e.g. `sa_first`), its lowest-numbered
+    stack. None if it has none."""
+    first = first_group(region)
+    group = region if first is None else first
     candidates = [view for view in item["views"] if view in views and view_group(view) == group]
     if not candidates:
         return None
+    if first is not None:
+        return min(candidates, key=_view_index)
     heights = {view: stack_height_mm(item["views"][view]["geometry"]) for view in candidates}
     tallest = max(heights.values())
     return max((view for view in candidates if heights[view] >= tallest - 1e-3), key=_view_index)
@@ -184,9 +237,9 @@ def heldout_projection(
     for every method scored on it.
 
     Scored on the voxels of `view` the forward model supports; with `region`
-    (a view group, e.g. `sa`), only those inside the tallest of the item's
-    stacks of that group in the geometry's views (`region_stack`,
-    `stack_region`). None if the item lacks the view or no voxel is left.
+    (a view group, e.g. `sa`, or `sa_first`), only those inside the stack
+    `region_stack` picks from the item's stacks in the geometry's views
+    (`stack_region`). None if the item lacks the view or no voxel is left.
     """
     if view not in item["views"]:
         return None
@@ -231,9 +284,9 @@ def evaluate_item(
     r"""Predictions of the held-out `view` of `item` from `conditioning_views`.
 
     Scored on the voxels of `view` the forward model supports; with `region`
-    (a view group, e.g. `sa`), only those inside the tallest of the item's
-    stacks of that group that the model was trained on (`region_stack`,
-    `stack_region`), whichever views it is conditioned on.
+    (a view group, e.g. `sa`, or `sa_first`), only those inside the stack
+    `region_stack` picks from the item's stacks that the model was trained on
+    (`stack_region`), whichever views it is conditioned on.
 
     Returns the metrics row, the predictions, the projected samples' per-voxel
     standard deviation (None with fewer than 2 samples) and the target (raw
@@ -334,7 +387,8 @@ def main(argv=None):
     parser.add_argument(
         "--conditioning_views",
         nargs="+",
-        help="Conditioning sets: `all`, or comma-separated views or groups, e.g. `all sa la_2ch`. Default: all",
+        help="Conditioning sets: `all`, comma-separated views or groups, or `<group>_first` (the subject's "
+        "lowest-numbered stack of it), e.g. `all sa sa_first la_2ch`. Default: all",
     )
     parser.add_argument("--data_dir", help="Defaults to the training config's, e.g. to evaluate on a separate test set")
     parser.add_argument("--subjects", nargs="+", help="Subject names. Default: the subjects of --split")
@@ -351,7 +405,8 @@ def main(argv=None):
     )
     parser.add_argument(
         "--region",
-        help="Score only inside the tallest stack of this view group, e.g. sa; none: everywhere. Default: none",
+        help="Score only inside one stack of this view group: sa, its tallest; sa_first, its lowest-numbered; "
+        "none: everywhere. Default: none",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -396,7 +451,8 @@ def main(argv=None):
         conditioning_sets = {spec: resolve_conditioning(spec, geometry.views) for spec in args.conditioning_views}
     except ValueError as error:
         parser.error(str(error))
-    if args.region is not None and not any(view_group(v) == args.region for v in geometry.views):
+    region_group = None if args.region is None else (first_group(args.region) or args.region)
+    if region_group is not None and not any(view_group(v) == region_group for v in geometry.views):
         parser.error(f"--region `{args.region}` is no group of the views the model was trained on: {geometry.views}")
 
     data_dir = args.data_dir or config["data"]["data_dir"]
@@ -424,7 +480,7 @@ def main(argv=None):
                 subjects=names,
                 extra_noise_std=config["data"]["extra_noise_std"],
                 views=list(geometry.views) + [view],
-                norm_views=conditioning_views,
+                norm_views=norm_views_for(spec, conditioning_views),
                 train=False,
                 frame=args.frame,
             )
@@ -440,8 +496,8 @@ def main(argv=None):
                 with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
                     torch.manual_seed(args.seed + zlib.crc32(f"{item['subject']}/{spec}".encode()))
                     result = evaluate_item(
-                        model, item, view, args.n_samples, conditioning_views, amp=amp, direct=direct,
-                        region=args.region,
+                        model, item, view, args.n_samples, item_conditioning(spec, item, conditioning_views),
+                        amp=amp, direct=direct, region=args.region,
                     )
                 if result is None:
                     continue

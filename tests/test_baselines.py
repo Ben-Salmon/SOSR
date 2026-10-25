@@ -1,4 +1,5 @@
 r"""Interpolation and SMORE baselines, on a synthetic subject. CPU only.
+They use each subject's lowest-numbered short-axis stack only.
 
 SMORE itself is not run: its output is faked on a grid twice as fine through
 the slices, with the affine SMORE would write, to test how it is read.
@@ -92,12 +93,6 @@ def test_sample_takes_the_edge_value_outside_the_volume():
         assert torch.allclose(baselines.sample(volume, points, order), torch.tensor([0.0, 3.0, 1.0], dtype=torch.float64))
 
 
-def test_fuse_averages_covering_stacks_and_falls_back_to_one():
-    values = [torch.tensor([1.0, 2.0, 3.0]), torch.tensor([3.0, 4.0, 5.0])]
-    inside = [torch.tensor([True, True, False]), torch.tensor([True, False, False])]
-    assert torch.equal(baselines.fuse(values, inside, fallback=1).float(), torch.tensor([2.0, 2.0, 5.0]))
-
-
 def test_export_writes_the_evaluated_corrected_frame(tmp_path):
     correction = np.zeros((9, 2), dtype=np.int16)
     correction[2] = [1, -2]
@@ -109,10 +104,10 @@ def test_export_writes_the_evaluated_corrected_frame(tmp_path):
          "--out_dir", str(out_dir), "--device", "cpu"]
     )
 
-    dataset, _ = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geometry(views=["sa_1"]))
+    dataset = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geometry(views=["sa_1"]))
     frame = dataset[0]["frame"]
     with open(out_dir / subject.name / "manifest.json") as f:
-        assert json.load(f) == {"subject": subject.name, "frame": frame, "stacks": ["sa_1"]}
+        assert json.load(f) == {"subject": subject.name, "frame": frame, "stack": "sa_1"}
     img = nib.load(str(subject / "sa_1.nii.gz"))
     exported = nib.load(str(out_dir / subject.name / "sa_1.nii.gz"))
     assert np.array_equal(exported.get_fdata(), translate_slices(load_frame(img, frame), correction))
@@ -121,12 +116,28 @@ def test_export_writes_the_evaluated_corrected_frame(tmp_path):
     assert (out_dir / "stacks.txt").read_text().split() == [str((out_dir / subject.name / "sa_1.nii.gz").resolve())]
 
 
+def test_export_writes_only_the_lowest_numbered_stack(tmp_path):
+    data_dir = tmp_path / "data"
+    write_subject(data_dir, name="both", views=("sa_1", "sa_2", "la_4ch"), frames=(5, 3, 4))
+    write_subject(data_dir, name="no_sa_1", views=("sa_2", "la_4ch"), frames=(3, 4))
+    checkpoint = tmp_path / "model.pt"
+    torch.save({"geometry_config": dict(GEOMETRY_CONFIG, VIEWS=["sa_1", "sa_2"]), "config": {"model": {}}}, checkpoint)
+    out_dir = tmp_path / "smore"
+    baselines.main(["export", "--checkpoint", str(checkpoint), "--data_dir", str(data_dir), "--out_dir", str(out_dir),
+                    "--device", "cpu"])
+    for name, stack in (("both", "sa_1"), ("no_sa_1", "sa_2")):
+        assert sorted(p.name for p in (out_dir / name).glob("*.nii.gz")) == [f"{stack}.nii.gz"]
+        with open(out_dir / name / "manifest.json") as f:
+            assert json.load(f)["stack"] == stack
+    assert len((out_dir / "stacks.txt").read_text().split()) == 2
+
+
 def test_every_source_recovers_a_ramp_on_the_latent_grid(tmp_path):
     geom = geometry(views=["sa_1"])
     subject = write_ramp_subject(tmp_path / "data")
     out_dir = tmp_path / "smore"
     args = args_for(tmp_path / "data", out_dir)
-    dataset, _ = baselines.evaluation_dataset(args, geom)
+    dataset = baselines.evaluation_dataset(args, geom)
     item = dataset[0]
     baselines.export(args, geom)
     fake_smore(out_dir, subject.name)
@@ -138,7 +149,7 @@ def test_every_source_recovers_a_ramp_on_the_latent_grid(tmp_path):
     interior = ((vox >= 1) & (vox <= sizes - 3)).all(dim=-1).reshape(geom.size_lvox)
     assert interior.sum() > 1000
     for source in baselines.SOURCES:
-        volume = baselines.latent_volume(item, ["sa_1"], source, out_dir, geom)
+        volume = baselines.latent_volume(item, "sa_1", source, out_dir, geom)
         assert torch.allclose(volume[interior], expected[interior], atol=1e-3), source
 
 
@@ -152,19 +163,19 @@ def test_project_writes_scorable_predictions(tmp_path):
     baselines.main(["export", *common])
     fake_smore(out_dir, subject.name)
 
-    # What mrisr-evaluate --save_predictions --conditioning_views sa writes.
+    # What mrisr-evaluate --save_predictions --conditioning_views sa_first --region sa_first writes.
     evaluation_dir = tmp_path / "evaluation"
-    dataset, _ = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geom)
+    dataset = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geom)
     item = dataset[0]
-    projection = heldout_projection(item, "la_4ch", geom, region="sa")
-    subject_dir = evaluation_dir / "sa" / subject.name
+    projection = heldout_projection(item, "la_4ch", geom, region="sa_first")
+    subject_dir = evaluation_dir / "sa_first" / subject.name
     save_predictions(str(subject_dir), item, "la_4ch", {}, projection.target, projection.mask)
 
     baselines.main(["project", *common, "--evaluation_dir", str(evaluation_dir)])
     for source in baselines.SOURCES:
         saved = nib.load(str(subject_dir / f"la_4ch_pred_{source}.nii.gz"))
         assert saved.header["toffset"] == item["frame"]
-        volume = baselines.latent_volume(item, ["sa_1"], source, out_dir, geom)
+        volume = baselines.latent_volume(item, "sa_1", source, out_dir, geom)
         expected = projection.project(baselines.normalise(volume, item))
         on_grid = saved.get_fdata()[tuple(slice(s, s + n) for s, n in zip(item["views"]["la_4ch"]["crop_start"],
                                                                          expected.shape))]
@@ -181,14 +192,14 @@ def test_project_skips_subjects_without_smore_output(tmp_path, capsys):
               "--out_dir", str(out_dir), "--device", "cpu"]
     baselines.main(["export", *common])
     evaluation_dir = tmp_path / "evaluation"
-    dataset, _ = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geom)
+    dataset = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geom)
     item = dataset[0]
-    projection = heldout_projection(item, "la_4ch", geom, region="sa")
-    save_predictions(str(evaluation_dir / "sa" / subject.name), item, "la_4ch", {}, projection.target, projection.mask)
+    projection = heldout_projection(item, "la_4ch", geom, region="sa_first")
+    save_predictions(str(evaluation_dir / "sa_first" / subject.name), item, "la_4ch", {}, projection.target, projection.mask)
 
     baselines.main(["project", *common, "--evaluation_dir", str(evaluation_dir)])
-    assert (evaluation_dir / "sa" / subject.name / "la_4ch_pred_cubic.nii.gz").is_file()
-    assert not (evaluation_dir / "sa" / subject.name / "la_4ch_pred_smore.nii.gz").exists()
+    assert (evaluation_dir / "sa_first" / subject.name / "la_4ch_pred_cubic.nii.gz").is_file()
+    assert not (evaluation_dir / "sa_first" / subject.name / "la_4ch_pred_smore.nii.gz").exists()
     assert "no SMORE output" in capsys.readouterr().out
 
 

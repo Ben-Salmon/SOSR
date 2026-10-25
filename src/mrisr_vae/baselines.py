@@ -1,39 +1,40 @@
-r"""Baselines scored like the VAE on a held-out view: interpolation of the
-short-axis stacks (linear, cubic) and SMORE (Remedios et al. 2023), run
-unmodified from its own repository.
+r"""Baselines scored like the VAE on a held-out view, from each subject's
+lowest-numbered short-axis stack alone: interpolation of it (linear, cubic)
+and SMORE (Remedios et al. 2023) on it, run unmodified from its pip-installed
+package (slurm/smore.sh). Score the models on the same stack:
+`mrisr-evaluate --conditioning_views sa_first --region sa_first`.
 
     uv run mrisr-baselines export  --checkpoint <ckpt> --data_dir <test> --out_dir <dir>
     (SMORE on each <dir>/<subject>/<stack>.nii.gz: slurm/smore.sh)
     uv run mrisr-baselines project --checkpoint <ckpt> --data_dir <test> --out_dir <dir> \
-        --evaluation_dir <mrisr-evaluate --save_predictions --conditioning_views sa out_dir>
+        --evaluation_dir <mrisr-evaluate --save_predictions --conditioning_views sa_first --region sa_first out_dir>
     uv run mrisr-baselines check   --checkpoint <ckpt> --data_dir <test> --out_dir <dir> --max_subjects 2
 
 Every subcommand builds each subject's item as `mrisr-evaluate` does for the
-`sa` conditioning set, with the latent geometry of the evaluated checkpoint,
-so the subjects, the frame and the breathhold-corrected stacks are the
-evaluation's.
+`sa_first` conditioning set, with the latent geometry of the evaluated
+checkpoint, so the subjects, the frame, the stack, its breathhold correction
+and the normalisation are the evaluation's.
 
-export   writes, per subject, the evaluated frame of each short-axis stack the
-         model sees, with its per-slice breathhold translations applied, as a
-         3D NIfTI on the stack's own grid (<out_dir>/<subject>/<stack>.nii.gz),
+export   writes, per subject, the evaluated frame of its lowest-numbered
+         short-axis stack, with its per-slice breathhold translations applied,
+         as a 3D NIfTI on the stack's own grid (<out_dir>/<subject>/<stack>.nii.gz),
          a manifest.json, and <out_dir>/stacks.txt listing every stack for the
          SLURM array.
 
 project  resamples each source onto the latent grid and pushes it through the
          held-out view's forward model, exactly as `mrisr-evaluate` projects
          the VAE's volume, writing <view>_pred_<source>.nii.gz beside the saved
-         target and mask (<evaluation_dir>/sa/<subject>/) for `mrisr-score`.
+         target and mask (<evaluation_dir>/sa_first/<subject>/) for `mrisr-score`.
          Sources: linear and cubic (trilinear and Keys tricubic interpolation
-         of the exported stacks) and smore (SMORE's output,
+         of the exported stack) and smore (SMORE's output,
          <out_dir>/<subject>/smore/<stack>/<stack>_smore4.nii.gz, mapped to the
-         stack's voxels by SMORE's own output affine). Stacks are averaged
-         where they overlap; latent voxels outside every stack take the
-         tallest stack's edge value.
+         stack's voxels by SMORE's own output affine). Latent voxels outside
+         the stack take its edge value.
 
-check    pushes each source's latent volume back through each short-axis
-         stack's own forward model and scores it against that stack, with
-         SMORE's output also shifted by +-0.5 input slices: the unshifted
-         SMORE volume should agree best, or its grid is misplaced.
+check    pushes each source's latent volume back through the stack's own
+         forward model and scores it against the stack, with SMORE's output
+         also shifted by +-0.5 input slices: the unshifted SMORE volume should
+         agree best, or its grid is misplaced.
 """
 
 import argparse
@@ -49,10 +50,10 @@ from tqdm import tqdm
 from .data import NORMALISED_STD, CMRObservationDataset, load_frame, translate_slices
 from .evaluate import (
     heldout_projection,
-    inside_stack,
+    item_conditioning,
     lvox_to_stack_vox,
+    norm_views_for,
     on_image_grid,
-    region_stack,
     resolve_conditioning,
     save_on_image_grid,
 )
@@ -61,8 +62,9 @@ from .geometry import LatentGeometry
 from .metrics import masked_metrics
 
 SOURCES = ("linear", "cubic", "smore")
-# `mrisr-evaluate` writes the `sa` conditioning set's files under this name.
-CONDITIONING = "sa"
+# Each subject's lowest-numbered short-axis stack; `mrisr-evaluate` writes this
+# conditioning set's files under the same name.
+CONDITIONING = "sa_first"
 SMORE_SUFFIX = "_smore4"
 
 
@@ -174,45 +176,29 @@ def source_volume(
     return torch.from_numpy(np.asarray(volume, dtype=np.float32)), torch.from_numpy(to_input)
 
 
-def fuse(values: list[torch.Tensor], inside: list[torch.Tensor], fallback: int) -> torch.Tensor:
-    r"""The average of each stack's values where it covers a point; where none
-    does, stack `fallback`'s value."""
-    weights = torch.stack([m.to(torch.float64) for m in inside])
-    stacked = torch.stack(values)
-    total = weights.sum(0)
-    average = (weights * stacked).sum(0) / total.clamp_min(1)
-    return torch.where(total > 0, average, stacked[fallback])
-
-
 def latent_volume(
     item: dict,
-    stacks: list[str],
+    stack: str,
     source: str,
     out_dir: Path,
     geometry: LatentGeometry,
     shift_slices: float = 0.0,
     device="cpu",
 ) -> torch.Tensor | None:
-    r"""The source's volume of `stacks`, raw intensities, on the latent grid
-    (D, H, W); None if SMORE's output is missing for any stack. `shift_slices`
-    moves the source along the stack's slice axis, in input slices (`check`)."""
+    r"""The source's volume of `stack`, raw intensities, on the latent grid
+    (D, H, W), the stack's edge value outside it; None if SMORE's output is
+    missing. `shift_slices` moves the source along the stack's slice axis, in
+    input slices (`check`)."""
+    loaded = source_volume(source, out_dir, item["subject"], stack)
+    if loaded is None:
+        return None
+    volume, to_input = loaded
     order = 1 if source == "linear" else 3
-    lvox = latent_coords(geometry)
-    values, inside = [], []
-    for stack in stacks:
-        loaded = source_volume(source, out_dir, item["subject"], stack)
-        if loaded is None:
-            return None
-        volume, to_input = loaded
-        lvox_to_vox = lvox_to_stack_vox(item, stack, geometry)
-        vox = apply_affine(lvox_to_vox, lvox.T).T  # (N, 3) in the stack's voxels
-        shifted = vox - torch.tensor([0.0, 0.0, shift_slices], dtype=torch.float64)
-        source_vox = apply_affine(torch.linalg.inv(to_input), shifted.T).T
-        values.append(sample(volume.to(device), source_vox, order).cpu())
-        inside.append(inside_stack(vox, item["views"][stack]["geometry"]))
-    # The tallest of these stacks, as `region_stack` picks the scored region's.
-    tallest = region_stack(item, CONDITIONING, stacks)
-    return fuse(values, inside, stacks.index(tallest)).reshape(geometry.size_lvox)
+    lvox_to_vox = lvox_to_stack_vox(item, stack, geometry)
+    vox = apply_affine(lvox_to_vox, latent_coords(geometry).T).T  # (N, 3) in the stack's voxels
+    shifted = vox - torch.tensor([0.0, 0.0, shift_slices], dtype=torch.float64)
+    source_vox = apply_affine(torch.linalg.inv(to_input), shifted.T).T
+    return sample(volume.to(device), source_vox, order).cpu().reshape(geometry.size_lvox)
 
 
 def normalise(volume: torch.Tensor, item: dict) -> torch.Tensor:
@@ -232,22 +218,33 @@ def load_geometry(checkpoint: str) -> tuple[LatentGeometry, int]:
     return geometry, lanczos_a
 
 
-def evaluation_dataset(args, geometry: LatentGeometry) -> tuple[CMRObservationDataset, list[str]]:
-    r"""The dataset `mrisr-evaluate` builds for the `sa` conditioning set (on a
-    separate test set: every subject of it), and the short-axis views."""
-    sa_views = resolve_conditioning(CONDITIONING, geometry.views)
+def evaluation_dataset(args, geometry: LatentGeometry) -> CMRObservationDataset:
+    r"""The dataset `mrisr-evaluate` builds for the `sa_first` conditioning set
+    (on a separate test set: every subject of it)."""
+    candidates = resolve_conditioning(CONDITIONING, geometry.views)
     dataset = CMRObservationDataset(
         args.data_dir,
         geometry,
         subjects=args.subjects,
         views=list(geometry.views) + [args.view],
-        norm_views=sa_views,
+        norm_views=norm_views_for(CONDITIONING, candidates),
         train=False,
         frame=args.frame,
     )
     if args.max_subjects is not None:
         dataset.subjects = dataset.subjects[: args.max_subjects]
-    return dataset, sa_views
+    return dataset
+
+
+def conditioning_stack(item: dict) -> str | None:
+    r"""The stack `mrisr-evaluate` conditions `item` on for `sa_first`: its
+    lowest-numbered short-axis stack, which set its normalisation. None if
+    that stack was left out of the item (e.g. the forward model's grid did
+    not match its crop)."""
+    stacks = item_conditioning(CONDITIONING, item, [])
+    if len(stacks) != 1 or stacks[0] not in item["views"]:
+        return None
+    return stacks[0]
 
 
 def items(dataset):
@@ -284,30 +281,28 @@ def stack_problems(img: nib.Nifti1Image, stack_geometry: dict) -> list[str]:
 
 
 def export(args, geometry: LatentGeometry):
-    dataset, sa_views = evaluation_dataset(args, geometry)
+    dataset = evaluation_dataset(args, geometry)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stack_files, skipped = [], {}
     for item in items(dataset):
         subject = item["subject"]
-        subject_dir = Path(args.data_dir) / subject
-        stacks = [view for view in sa_views if view in item["views"]]
-        exported = []
-        for stack in stacks:
-            data, img = corrected_frame(subject_dir, stack, item["frame"])
-            nifti = nib.Nifti1Image(data.astype(np.float32), affine=img.affine)
-            problems = stack_problems(nifti, item["views"][stack]["geometry"])
-            if problems:
-                skipped[f"{subject}/{stack}"] = problems
-                continue
-            path = out_dir / subject / f"{stack}.nii.gz"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            nib.save(nifti, str(path))
-            exported.append(stack)
-            stack_files.append(str(path.resolve()))
-        if exported:
-            with open(out_dir / subject / "manifest.json", "w") as f:
-                json.dump({"subject": subject, "frame": item["frame"], "stacks": exported}, f, indent=2)
+        stack = conditioning_stack(item)
+        if stack is None:
+            skipped[subject] = [f"its lowest-numbered short-axis stack {item['norm_views']} is not usable"]
+            continue
+        data, img = corrected_frame(Path(args.data_dir) / subject, stack, item["frame"])
+        nifti = nib.Nifti1Image(data.astype(np.float32), affine=img.affine)
+        problems = stack_problems(nifti, item["views"][stack]["geometry"])
+        if problems:
+            skipped[f"{subject}/{stack}"] = problems
+            continue
+        path = out_dir / subject / f"{stack}.nii.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        nib.save(nifti, str(path))
+        stack_files.append(str(path.resolve()))
+        with open(out_dir / subject / "manifest.json", "w") as f:
+            json.dump({"subject": subject, "frame": item["frame"], "stack": stack}, f, indent=2)
     with open(out_dir / "stacks.txt", "w") as f:
         f.writelines(f"{path}\n" for path in stack_files)
     print(f"Exported {len(stack_files)} stacks to {out_dir}; listed in {out_dir / 'stacks.txt'}")
@@ -315,14 +310,21 @@ def export(args, geometry: LatentGeometry):
         print(f"Skipped {name}: {'; '.join(problems)}")
 
 
-def checked_manifest(args, item) -> list[str] | None:
+def checked_manifest(args, item) -> str | None:
+    r"""The exported stack of `item`, checked to be the evaluated frame and stack."""
     manifest = read_manifest(args.out_dir, item["subject"])
     if manifest is None:
         tqdm.write(f"{item['subject']}: not exported; skipped")
         return None
+    if "stack" not in manifest:
+        raise RuntimeError(f"{item['subject']}: exported by an older mrisr-baselines (every stack); rerun export")
     if manifest["frame"] != item["frame"]:
         raise RuntimeError(f"{item['subject']}: exported frame {manifest['frame']}, evaluated frame {item['frame']}")
-    return manifest["stacks"]
+    if manifest["stack"] != conditioning_stack(item):
+        raise RuntimeError(
+            f"{item['subject']}: exported {manifest['stack']}, but conditioned on {conditioning_stack(item)}"
+        )
+    return manifest["stack"]
 
 
 def check_saved(path: Path, values: np.ndarray, what: str, atol: float):
@@ -332,7 +334,7 @@ def check_saved(path: Path, values: np.ndarray, what: str, atol: float):
 
 
 def project(args, geometry: LatentGeometry, lanczos_a: int):
-    dataset, _ = evaluation_dataset(args, geometry)
+    dataset = evaluation_dataset(args, geometry)
     missing = {source: [] for source in args.sources}
     written = {source: 0 for source in args.sources}
     for item in items(dataset):
@@ -342,8 +344,8 @@ def project(args, geometry: LatentGeometry, lanczos_a: int):
         if not target_path.is_file():
             tqdm.write(f"{subject}: no saved target in {subject_dir}; skipped")
             continue
-        stacks = checked_manifest(args, item)
-        if stacks is None:
+        stack = checked_manifest(args, item)
+        if stack is None:
             continue
         projection = heldout_projection(
             item, args.view, geometry, lanczos_a=lanczos_a, region=args.region, device=args.device
@@ -355,7 +357,7 @@ def project(args, geometry: LatentGeometry, lanczos_a: int):
         check_saved(target_path, on_image_grid(projection.target, heldout), "target", atol=1e-2)
         check_saved(subject_dir / f"{args.view}_mask.nii.gz", on_image_grid(projection.mask, heldout), "mask", 1e-6)
         for source in args.sources:
-            volume = latent_volume(item, stacks, source, args.out_dir, geometry, device=args.device)
+            volume = latent_volume(item, stack, source, args.out_dir, geometry, device=args.device)
             if volume is None:
                 missing[source].append(subject)
                 continue
@@ -366,35 +368,33 @@ def project(args, geometry: LatentGeometry, lanczos_a: int):
     for source in args.sources:
         print(f"{source}: wrote {written[source]} predictions")
         if missing[source]:
-            print(f"{source}: no SMORE output for every stack of {len(missing[source])} subjects: {missing[source]}")
+            print(f"{source}: no SMORE output for {len(missing[source])} subjects: {missing[source]}")
 
 
 def check(args, geometry: LatentGeometry, lanczos_a: int):
-    r"""Each source's agreement with the short-axis stacks it came from."""
-    dataset, _ = evaluation_dataset(args, geometry)
+    r"""Each source's agreement with the short-axis stack it came from."""
+    dataset = evaluation_dataset(args, geometry)
     variants = [(source, 0.0) for source in args.sources]
     if "smore" in args.sources:
         variants += [("smore", -0.5), ("smore", 0.5)]
     rows = []
     for item in items(dataset):
-        stacks = checked_manifest(args, item)
-        if stacks is None:
+        stack = checked_manifest(args, item)
+        if stack is None:
             continue
         scale = item["norm_std"] / NORMALISED_STD
+        A = BatchOperator([{stack: item["views"][stack]["op"]}], geometry.size_lvox, lanczos_a=lanczos_a)
+        A = A.to(args.device)
+        target = item["views"][stack]["y"].to(args.device)[0, 0] * scale + item["norm_mean"]
+        mask = A.op(0, stack).row_mask
         for source, shift in variants:
-            volume = latent_volume(item, stacks, source, args.out_dir, geometry, shift_slices=shift, device=args.device)
+            volume = latent_volume(item, stack, source, args.out_dir, geometry, shift_slices=shift, device=args.device)
             if volume is None:
                 continue
-            x = normalise(volume, item).to(args.device)
-            for stack in stacks:
-                op = item["views"][stack]["op"]
-                A = BatchOperator([{stack: op}], geometry.size_lvox, lanczos_a=lanczos_a).to(args.device)
-                with torch.no_grad():
-                    predicted = A(x)[0][0][0, 0] * scale + item["norm_mean"]
-                target = item["views"][stack]["y"].to(args.device)[0, 0] * scale + item["norm_mean"]
-                mask = A.op(0, stack).row_mask
-                metrics = masked_metrics(predicted * mask, target * mask, mask)
-                rows.append({"subject": item["subject"], "stack": stack, "source": source, "shift": shift, **metrics})
+            with torch.no_grad():
+                predicted = A(normalise(volume, item).to(args.device))[0][0][0, 0] * scale + item["norm_mean"]
+            metrics = masked_metrics(predicted * mask, target * mask, mask)
+            rows.append({"subject": item["subject"], "stack": stack, "source": source, "shift": shift, **metrics})
     if not rows:
         print("Nothing to check")
         return
@@ -407,7 +407,7 @@ def check(args, geometry: LatentGeometry, lanczos_a: int):
         selected = [r for r in rows if r["source"] == source and r["shift"] == shift]
         if selected:
             psnr = np.nanmean([r["psnr"] for r in selected])
-            print(f"{source} shifted {shift:+.1f} slices: {len(selected)} stacks; mean psnr {psnr:.2f} against the stacks")
+            print(f"{source} shifted {shift:+.1f} slices: {len(selected)} stacks; mean psnr {psnr:.2f} against them")
     print(f"Wrote {out}")
 
 
@@ -419,7 +419,9 @@ def main(argv=None):
     parser.add_argument("--out_dir", required=True, help="Exported stacks, manifests and SMORE outputs")
     parser.add_argument("--evaluation_dir", help="project: an mrisr-evaluate --save_predictions out_dir")
     parser.add_argument("--view", default="la_4ch", help="The held-out view. Default: la_4ch")
-    parser.add_argument("--region", default="sa", help="As mrisr-evaluate's --region; none: everywhere. Default: sa")
+    parser.add_argument(
+        "--region", default="sa_first", help="As mrisr-evaluate's --region; none: everywhere. Default: sa_first"
+    )
     parser.add_argument("--sources", nargs="+", choices=SOURCES, default=list(SOURCES))
     parser.add_argument("--subjects", nargs="+", help="Default: every subject of data_dir")
     parser.add_argument("--max_subjects", type=int)
