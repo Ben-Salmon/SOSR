@@ -1,10 +1,12 @@
 # Copy of diffusion-priors/latent_image_geometry/kaggle_cmr_train.yaml, so that
-# the two models super-resolve onto the same grid.
+# the two models super-resolve onto the same grid. To size a grid for new data,
+# run mrisr-latent-extent (slurm/latent-extent.sh). For this grid, diffusion-priors'
+# equivalent script reported:
 #
-# SU per vox:  [ 1.40625  1.40625 10.     ]
-# Lowest coords su:  [-127.9972855   -97.63257305 -130.73507466]
-# Highest coords su:  [127.9972855   97.63257305 130.73507466]
-# Size su:  [255.99457101 195.2651461  261.47014932]
+# Median mm per voxel:  [ 1.40625  1.40625 10.     ]
+# ROI lowest coordinate, 10th percentile (SU):  [-127.9972855   -97.63257305 -130.73507466]
+# ROI highest coordinate, 90th percentile (SU):  [127.9972855   97.63257305 130.73507466]
+# ROI size (SU):  [255.99457101 195.2651461  261.47014932]
 
 
 # The only views training loads. la_4ch is held out for evaluation

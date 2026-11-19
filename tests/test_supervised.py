@@ -5,13 +5,13 @@ held-out view, here its target.
 """
 
 import copy
-import csv
 
 import pytest
 import torch
 import yaml
 
-from mrisr_vae import evaluate, predict
+from mrisr_vae import predict
+from mrisr_vae.evaluation import heldout, score
 from mrisr_vae.data import CMRObservationDataset, subjects_with_views
 from mrisr_vae.model import SupervisedPredictor, build_model
 from mrisr_vae.train import DEFAULTS, load_config
@@ -158,15 +158,33 @@ def test_supervised_checkpoint_predicts_and_is_evaluated(tmp_path):
     torch.save({"model": model.state_dict(), "config": config, "geometry_config": geometry_config}, checkpoint)
     common = ["--checkpoint", str(checkpoint), "--subjects", subject.name, "--device", "cpu", "--num_workers", "0"]
 
-    out_dir = tmp_path / "evaluation"
-    evaluate.main([*common, "--out_dir", str(out_dir), "--save_predictions"])
-    with open(out_dir / "metrics.csv") as f:
-        (row,) = list(csv.DictReader(f))
-    assert float(row["mse_supervised"]) > 0
-    assert "mse_sample" not in row and "mse_direct" not in row
-    assert (out_dir / "all" / subject.name / "la_2ch_pred_supervised.nii.gz").exists()
+    geometry_path = tmp_path / "geometry.yaml"
+    with open(geometry_path, "w") as f:
+        yaml.safe_dump(geometry_config, f)
+
+    def protocol(n_samples):
+        path = tmp_path / f"protocol_{n_samples}.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump(
+                {
+                    "out_dir": str(tmp_path / "evaluation"),
+                    "data_dir": str(data_dir),
+                    "geometry": str(geometry_path),
+                    "heldout_views": ["la_2ch"],
+                    "region": None,
+                    "methods": {"supervised": {"checkpoint": str(checkpoint), "n_samples": n_samples}},
+                },
+                f,
+            )
+        return ["--protocol", str(path), "--method", "supervised", "--device", "cpu", "--num_workers", "0"]
+
+    heldout.main(protocol(0))
+    (row,) = score.score_directory(tmp_path / "evaluation")
+    assert row["method"] == "supervised" and float(row["mse"]) > 0 and "mean_std" not in row
+    assert (tmp_path / "evaluation" / "all" / subject.name / "la_2ch_pred_supervised.nii.gz").exists()
+    # The baseline has no posterior to sample.
     with pytest.raises(SystemExit):
-        evaluate.main([*common, "--out_dir", str(out_dir), "--n_samples", "2"])
+        heldout.main(protocol(2))
 
     predictions = tmp_path / "predictions"
     predict.main([*common, "--out_dir", str(predictions), "--method", "direct"])

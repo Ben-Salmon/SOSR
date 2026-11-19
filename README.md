@@ -65,6 +65,11 @@ over after breathhold correction.
 
 ```
 src/mrisr_vae/
+  preprocess/        before training
+    breathhold/      mrisr-breathhold: slice alignment (Stolt-Ansó et al., see its README)
+    registration.py  mrisr-register: registration_params.pickle per subject
+    heart_roi.py     the heart's bounding box (Zambal et al. 2008), for the centre of mass
+    latent_extent.py mrisr-latent-extent: how big to make the latent grid
   geometry.py        latent grid (explicit object; replaces init_geometry's globals)
   forward_model.py   Lanczos operator copied from diffusion-priors, per-view builder, adjoint
   data.py            one frame of one subject per item; operators built in the workers
@@ -75,8 +80,16 @@ src/mrisr_vae/
   trainer.py         Adamax with warm-up, early stopping, resumable checkpoints, wandb
   train.py           entry point mrisr-train (config options and defaults: DEFAULTS)
   predict.py         entry point mrisr-predict
-configs/             geometry (copied from diffusion-priors) and training config
-slurm/               training and prediction jobs
+  metrics.py         masked mse, psnr, ssim and Spearman, used by every score
+  evaluation/        after training: one protocol for every method
+    protocol.py      the protocol yaml (configs/evaluation/)
+    heldout.py       mrisr-evaluate: a model's predictions of the held-out view
+    baselines.py     mrisr-baselines: interpolation and SMORE predictions
+    score.py         mrisr-score: scores.csv and summary.csv over every method
+    conditioning.py  conditioning sets and the scored region
+    files.py         the evaluation directory's layout
+configs/             training configs, latent geometries, evaluation/ protocols
+slurm/               one job per step below
 tests/               CPU unit tests, GPU memory probe, smoke run
 ```
 
@@ -88,76 +101,117 @@ uv sync
 
 ## Running
 
-Submit every job from the repository root. Each one writes `logs/<job-name>-<job-id>.out`. In order:
+Submit every job from the repository root. Each one writes
+`logs/<job-name>-<job-id>.out`. Nothing heavy runs on the login node.
 
-1. `sbatch tests/run-tests.sh` (CPU, minutes). Runs the unit tests on synthetic data, including a check that the forward model matches diffusion-priors'.
+### 1. Preprocess
+
+1. **Breathhold correction** (CMR only). Aligns every short- and long-axis
+   slice of a subject by matching intensities where they intersect; writes
+   `<subject>/<view>_affine_correction.npy`. Once per directory:
+   `sbatch slurm/breathhold.sh --data_dir ../scratch/data/kaggle_niftis/train` (and `test`).
+2. **Registration.** Writes `<subject>/registration_params.pickle`: each
+   view's voxel-to-mm affine (with the correction), voxel size, slice
+   thickness and size, and `mm_to_su_affine`, which puts the ROI's centre of
+   mass (the heart's bounding box in the first CMR view; the bright voxels
+   of a brain) at the origin of the latent's frame.
+   `sbatch slurm/register.sh --dataset cmr --data_dirs <train> <test>`
+   (`--dataset brain` for fastMRI). Rerun it whenever the breathhold
+   correction is rerun: the dataset refuses a pickle built with other
+   corrections than those on disk. `--check` writes nothing and lists the
+   subjects whose parameters would change.
+3. **Latent grid size.** `sbatch slurm/latent-extent.sh --dataset cmr --data_dir <train> --su_per_lvox 1.8`
+   prints the ROI's extent over the training subjects (10th percentile of
+   the lows, 90th of the highs), the grid it suggests (`x_size_su`,
+   `X_MIN_COORDS_SU`) and the size the Ladder VAE pads it to. Copy it,
+   rounded as you like, into the geometry yaml (`configs/kaggle_cmr_geometry.yaml`).
+
+### 2. Train
+
+1. `sbatch tests/run-tests.sh` (CPU, minutes). Runs the unit tests on synthetic data, including a check that the forward model matches diffusion-priors', and that the preprocessing matches diffusion-priors' original scripts.
 2. `sbatch tests/memory-probe.sh` (GPU). Runs full-size training steps on real subjects and reports peak memory, time per step and loading time per item. Use it to set `batch_size` and `n_filters` in `configs/kaggle_cmr.yaml`.
 3. `sbatch tests/smoke-train.sh` (GPU). Trains 2 epochs on 8 subjects, resumes for a third, then predicts.
-4. `sbatch slurm/train.sh configs/kaggle_cmr.yaml --resume`. Resubmit to carry on from `last.pt`. The supervised baseline trains the same way, from `configs/kaggle_cmr_supervised.yaml` (see below).
-5. `sbatch slurm/predict.sh configs/kaggle_cmr.yaml`. The config's `predict` section picks the checkpoint (`best` or `last`), data, subjects, output directory and method (`direct`, `sampling` or `both`). Writes `sr_direct.nii.gz`, and/or `sr_mean.nii.gz` and `sr_std.nii.gz`, per subject; the supervised baseline writes `sr_supervised.nii.gz`.
-6. `sbatch slurm/evaluate.sh configs/kaggle_cmr.yaml`, and likewise `kaggle_cmr_direct.yaml` and `kaggle_cmr_supervised.yaml`. The config's `evaluate` section sets the checkpoint, data, conditioning sets, frame, samples and seed. Scores predictions of the held-out view on the test set (see below).
+4. `sbatch slurm/train.sh configs/kaggle_cmr.yaml --resume`. Resubmit to carry on from `last.pt`. Likewise `configs/kaggle_cmr_direct.yaml` (the direct predictor retrained on the frozen VAE) and `configs/kaggle_cmr_supervised.yaml` (the supervised baseline, below).
 
-## Held-out view
+### 3. Predict (optional)
 
-`data: heldout_views` (here `la_4ch`) lists views that training and validation
-never load. They must not be in the geometry's `VIEWS`, and `mrisr-train`
-refuses to start if they are. `la_2ch` stays in training, to show the model
-handles mixed views.
+`sbatch slurm/predict.sh configs/kaggle_cmr.yaml` writes super-resolved
+volumes on the latent grid. The config's `predict` section picks the
+checkpoint (`best` or `last`), data, subjects, output directory and method
+(`direct`, `sampling` or `both`). Writes `sr_direct.nii.gz`, and/or
+`sr_mean.nii.gz` and `sr_std.nii.gz`, per subject; the supervised baseline
+writes `sr_supervised.nii.gz`. Evaluation does not need it.
 
-`mrisr-evaluate` then conditions on chosen sets of training views. For
-example, `--conditioning_views all sa la_2ch` evaluates short axis plus
-`la_2ch`, short axis alone, and `la_2ch` alone, all on the same frame. Each set
-is normalised from its own views alone, so nothing else leaks into the input.
-`sa_first` conditions each subject on its lowest-numbered short-axis stack
-alone, the one stack the SMORE and interpolation baselines are given
-(`mrisr-baselines`, `slurm/baselines.sh`), so they compare like for like.
-For each set it projects the super-resolved volume through the held-out view's
-forward model, and scores it in raw intensities on the voxels that forward
-model supports, with MSE, PSNR and SSIM (definitions in `metrics.py`). It
-writes `metrics.csv`.
+### 4. Evaluate
 
-The CMR configs set `evaluate: region: sa_first` (`--region sa_first`): only
-the `la_4ch` voxels inside the subject's lowest-numbered short-axis stack are
-scored, the stack `sa_first` conditions on, within its field of view and from
-half a slice thickness below its first slice to half a thickness above its
-last. (`--region sa` takes the tallest stack instead, the highest index
-breaking ties.) The latent
-cube reaches above the ventricular base, but no training view images the
-atria there (`la_2ch` crosses `la_4ch` along one line only), so the VAE has no
-data for them, while the supervised baseline is trained on them. The region
-depends only on which stacks the subject has and their geometry, so every
-model and conditioning set is scored on the same voxels; `metrics.csv` gives their number (`n_voxels`) and
-the stack (`region_stack`). With `--save_predictions` it also writes the
-predictions, target and scoring mask on the view's own image grid, in
-`<conditioning>/<subject>/`.
+Every method is scored by one protocol,
+`configs/evaluation/kaggle_cmr_test.yaml`, into one directory (its
+`out_dir`), and compared in one table. In order (`p=configs/evaluation/kaggle_cmr_test.yaml`):
 
-To score another method, e.g. a network trained to predict `la_4ch` directly,
-save its predictions there as `la_4ch_pred_<name>.nii.gz` and run
-`mrisr-score --evaluation_dir <dir> --name <name>`. It uses the same metric
-code on the same voxels.
+1. The models, one job per method of the protocol (they can run at once):
+   `sbatch slurm/evaluate.sh $p vae`, `... $p vae_direct`, `... $p supervised`.
+2. The baselines: `sbatch slurm/baselines.sh export $p`, then the SMORE array
+   it prints (`sbatch --array=1-N%20 slurm/smore.sh <work_dir>/stacks.txt`;
+   install SMORE once first, see the top of `slurm/smore.sh`), then
+   `sbatch slurm/baselines.sh check $p --max_subjects 2` (SMORE's grid is
+   read right: the unshifted output should score best) and
+   `sbatch slurm/baselines.sh project $p`.
+3. `sbatch slurm/score.sh $p` writes `scores.csv` (one row per method,
+   conditioning set, subject and view) and `summary.csv` (per conditioning
+   set and method, mean, std and median over the subjects every method in
+   that set has) in `out_dir`, and prints the table.
 
-The three configs evaluate the same way, so their `metrics.csv` rows match on
-(conditioning, subject, frame, view):
+Steps 1 and 2 can run in either order, and a method can be added or rerun
+later: rerun step 3 after.
 
-- the test set, which none of the models has seen (the supervised baseline
-  was early-stopped on the validation subjects' `la_4ch`);
+**What the protocol fixes.** The held-out view (`heldout_views`, here
+`la_4ch`) is one training and validation never load: it must not be in the
+geometry's `VIEWS`, and `mrisr-train` refuses to start if it is. `la_2ch`
+stays in training, to show the model handles mixed views. Then, for every
+method alike:
+
+- the test set (`data_dir`), which none of the models has seen (the
+  supervised baseline was early-stopped on the validation subjects' `la_4ch`);
 - one frame per subject, fixed by its name, so phases vary across subjects
-  but not between models or runs;
-- conditioning on `all`, `sa`, `sa_first` and `la_2ch`;
-- 32 posterior samples for the VAE, reseeded per subject and conditioning
-  set from `seed`. The other two runs draw none: `kaggle_cmr_direct`'s VAE is
-  `kaggle_cmr`'s, frozen, and the baseline has no posterior.
-- `kaggle_cmr` sets `evaluate: direct: false` (`--no-direct`), so its scores
-  are those of the samples' mean alone, the estimate the std describes; the
-  direct predictor is scored by the `kaggle_cmr_direct` run.
+  but not between methods or runs;
+- the conditioning sets: `all` (every training view), `sa` (every short-axis
+  stack), `sa_first` (each subject's lowest-numbered short-axis stack, the
+  one the baselines are given) and `la_2ch`. Each set is normalised from its
+  own views alone, so nothing else leaks into the input;
+- the scored voxels: those of `la_4ch` its forward model supports, inside
+  each subject's lowest-numbered short-axis stack (`region: sa_first`):
+  within its field of view, and from half a slice thickness below its first
+  slice to half a thickness above its last. The latent cube reaches above
+  the ventricular base, but no training view images the atria there
+  (`la_2ch` crosses `la_4ch` along one line only), so the VAE has no data
+  for them, while the supervised baseline is trained on them. The region
+  depends only on the subject's stacks, so it is the same for every method
+  and conditioning set.
 
-With 2 or more samples, `mean_std` and `spearman_std_error` give the
-uncertainty of the sample mean in the held-out view and its rank correlation
-with the absolute error, per subject, over the scored voxels. The std is that
-of the samples after the forward model, which by linearity is the posterior's
-spread in the view; pushing the latent's per-voxel std through the forward
-model would ignore the correlations between neighbouring voxels.
-`--save_predictions` also writes it as `la_4ch_sample_std.nii.gz`.
+Each model method gives one prediction: with `n_samples` (the VAE's 32), the
+mean of that many posterior samples, reseeded per subject and conditioning
+set from `seed`; without, the model's direct predictor (or the supervised
+baseline's output). For each, the super-resolved volume is pushed through
+`la_4ch`'s forward model and saved on `la_4ch`'s own image grid as
+`<conditioning>/<subject>/la_4ch_pred_<method>.nii.gz`, beside the target and
+scoring mask, which every method checks are the ones the others used.
+`mrisr-score` then scores them all by the same code, in raw intensities: MSE,
+PSNR and SSIM (definitions in `metrics.py`). To score another method, save
+its predictions there as `la_4ch_pred_<name>.nii.gz` and rerun it.
+
+With 2 or more samples, the samples' spread after the forward model is saved
+as `la_4ch_std_<method>.nii.gz`, which by linearity is the posterior's spread
+in the view (pushing the latent's per-voxel std through the forward model
+would ignore the correlations between neighbouring voxels). `mrisr-score`
+reports its mean over the scored voxels (`mean_std`) and its rank
+correlation with the absolute error (`spearman_std_error`), per subject.
+`runs/<method>.csv` records what each run did per subject (frame,
+conditioning views, normalisation, and the average score of single samples).
+
+The baselines (`mrisr-baselines`) are linear and cubic interpolation of each
+subject's lowest-numbered short-axis stack, and SMORE (Remedios et al. 2023)
+run unmodified on it, resampled onto the latent grid and pushed through the
+same forward model; they appear under `sa_first`.
 
 ## Supervised baseline
 
@@ -172,11 +226,9 @@ input and never sets its normalisation. Subjects without it are skipped
 clipping, learning-rate plateaus, early stopping (on `val/target_mse`, the
 validation subjects' `la_4ch` error) and checkpoints are as for the VAE.
 
-The baseline trains on `la_4ch`, so it is scored on the test set, which
-neither model has seen: `sbatch slurm/evaluate.sh
-configs/kaggle_cmr_supervised.yaml` writes its scores as
-`*_supervised` in `metrics.csv`, on the same subjects, frames and voxels as the
-VAE's.
+The baseline trains on `la_4ch`, so it is scored on the test set only,
+which neither model has seen: method `supervised` of the evaluation protocol,
+on the same subjects, frames and voxels as the VAE.
 
 ## Validation metrics
 

@@ -30,9 +30,25 @@ srun uv run mrisr-predict --checkpoint "$SMOKE_DIR/last.pt" --out_dir "$SMOKE_DI
 
 ls -R "$SMOKE_DIR/predictions"
 
-# Held-out view (la_4ch) scores and predictions on the same 2 subjects.
-srun uv run mrisr-evaluate --checkpoint "$SMOKE_DIR/last.pt" --out_dir "$SMOKE_DIR/evaluation" \
-    --split val --max_subjects 2 --conditioning_views all sa la_2ch --n_samples 2 --save_predictions
+# Held-out view (la_4ch) predictions and scores on 2 validation subjects,
+# with a protocol for the smoke run: the sampled mean and the direct
+# predictor, inside sa_first, as configs/evaluation/kaggle_cmr_test.yaml.
+cat > "$SMOKE_DIR/protocol.yaml" <<PROTOCOL
+out_dir: $SMOKE_DIR/evaluation
+data_dir: $(uv run python -c "import yaml; print(yaml.safe_load(open('$CONFIG'))['data']['data_dir'])")
+geometry: configs/kaggle_cmr_geometry.yaml
+heldout_views: [la_4ch]
+region: sa_first
+conditioning_views: [all, sa, sa_first, la_2ch]
+split: val
+methods:
+  vae: {checkpoint: $SMOKE_DIR/last.pt, n_samples: 2}
+  vae_direct: {checkpoint: $SMOKE_DIR/last.pt}
+PROTOCOL
+for method in vae vae_direct; do
+    srun uv run mrisr-evaluate --protocol "$SMOKE_DIR/protocol.yaml" --method "$method" --max_subjects 2
+done
+srun uv run mrisr-score --protocol "$SMOKE_DIR/protocol.yaml"
 
 ls -R "$SMOKE_DIR/evaluation"
-cat "$SMOKE_DIR/evaluation/metrics.csv"
+cat "$SMOKE_DIR/evaluation/summary.csv"

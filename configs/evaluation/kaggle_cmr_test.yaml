@@ -1,0 +1,43 @@
+# The evaluation protocol for the Kaggle CMR models and baselines: every method
+# is scored on the same test subjects, frames, conditioning sets and voxels,
+# into one directory, and `mrisr-score` compares them in one table. See
+# src/mrisr_vae/evaluation/protocol.py for the options, and the README
+# (Evaluate) for the order to run things in. Paths are relative to the
+# repository root.
+
+out_dir: ../scratch/evaluation/kaggle_cmr_test
+# The test set, which no model has seen (the supervised baseline was
+# early-stopped on the validation subjects' la_4ch): all its subjects.
+data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
+# Every checkpoint below must have been trained on this grid.
+geometry: configs/kaggle_cmr_geometry.yaml
+heldout_views: [la_4ch]
+# Score la_4ch only inside each subject's lowest-numbered short-axis stack,
+# the stack the sa_first set and the baselines are given: the atria above it
+# are in no training view's data. The same voxels for every method and set.
+region: sa_first
+conditioning_views: [all, sa, sa_first, la_2ch]
+# null: a frame fixed per subject, the same for every method and run.
+frame: null
+seed: 0
+split: all
+
+# Each method gives one prediction: the mean of n_samples posterior samples,
+# or with n_samples 0 (the default) the model's direct predictor.
+methods:
+  # ~13% relative error on the per-voxel std behind spearman_std_error.
+  vae:
+    checkpoint: ../scratch/checkpoints/kaggle_cmr/best.pt
+    n_samples: 32
+  # The direct predictor retrained on kaggle_cmr's frozen VAE.
+  vae_direct:
+    checkpoint: ../scratch/checkpoints/kaggle_cmr_direct/best.pt
+  supervised:
+    checkpoint: ../scratch/checkpoints/kaggle_cmr_supervised/best.pt
+
+# Interpolation and SMORE on each subject's lowest-numbered short-axis stack,
+# scored under sa_first (mrisr-baselines).
+baselines:
+  sources: [linear, cubic, smore]
+  # Exported stacks and SMORE's outputs.
+  work_dir: ../scratch/smore/kaggle_cmr_test

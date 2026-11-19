@@ -7,8 +7,9 @@
 #
 #   sbatch slurm/train.sh configs/kaggle_cmr_supervised.yaml --resume
 #
-# la_4ch is held out from the input, not from training, so score this model
-# on the test set: sbatch slurm/evaluate.sh configs/kaggle_cmr_supervised.yaml
+# la_4ch is held out from the input, not from training, so this model is
+# scored on the test set only: method `supervised` of
+# configs/evaluation/kaggle_cmr_test.yaml.
 
 geometry: configs/kaggle_cmr_geometry.yaml
 checkpoint_dir: ../scratch/checkpoints/kaggle_cmr_supervised
@@ -80,19 +81,3 @@ predict:
   method: direct
   n_samples: 0
   save_samples: false
-
-# mrisr-evaluate --config only (sbatch slurm/evaluate.sh <this config>).
-# As kaggle_cmr.yaml's; the baseline has no posterior, so no samples.
-evaluate:
-  checkpoint: best
-  out_dir: ../scratch/checkpoints/kaggle_cmr_supervised/evaluation_test_best
-  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
-  conditioning_views: [all, sa, la_2ch]
-  frame: null
-  n_samples: 0
-  seed: 0
-  save_predictions: false
-  # Score la_4ch only inside the tallest short-axis stack (highest index
-  # breaking ties): the atria above it are in no training view's data. The
-  # same voxels for every model and conditioning set.
-  region: sa

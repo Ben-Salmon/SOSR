@@ -144,37 +144,6 @@ DEFAULTS = {
         "n_samples": 8,
         "save_samples": False,
     },
-    # Used by mrisr-evaluate --config only; training ignores it.
-    "evaluate": {
-        # best or last: <checkpoint_dir>/<checkpoint>.pt
-        "checkpoint": "best",
-        # None: <checkpoint_dir>/evaluation_<checkpoint>
-        "out_dir": None,
-        # None: data: data_dir. Another directory is a test set: all its subjects.
-        "data_dir": None,
-        # With the training data_dir only: val, train or all.
-        "split": "val",
-        # Each scored separately: all (every trained view), or comma-separated
-        # views or view groups, e.g. sa, la_2ch, sa,la_2ch.
-        "conditioning_views": ["all"],
-        # None: a frame fixed per subject, the same for every model and run.
-        "frame": None,
-        # Posterior samples (VAE only); 2 or more also give the per-voxel std
-        # and its correlation with the error. 0: direct predictor only.
-        "n_samples": 8,
-        # Samples are reseeded per subject and conditioning set from this.
-        "seed": 0,
-        # Write target, predictions, std and mask on the view's own grid.
-        "save_predictions": False,
-        # Score the direct predictor, if the model has one. False: the samples
-        # only, so every metric is of the samples behind the std.
-        "direct": True,
-        # A view group, e.g. sa: score only the held-out voxels inside the
-        # tallest stack of that group (highest index breaking ties), the same
-        # voxels whatever the conditioning set. None: wherever the held-out
-        # view's forward model is supported.
-        "region": None,
-    },
 }
 
 
@@ -207,38 +176,6 @@ def load_config(path: str) -> dict:
     else:
         raise ValueError(f"`model: type` must be one of {', '.join(MODEL_TYPES)}")
     return config
-
-
-def options_from_config(parser, args, section: str, keys, out_dir_prefix: str):
-    r"""Fills the options `keys` of `args` left unset (None) on the command
-    line from the `section` (predict or evaluate) of `args.config`, or from
-    its defaults without a config.
-
-    With a config, the checkpoint defaults to <checkpoint_dir>/<best|last>.pt
-    and out_dir to <checkpoint_dir>/<out_dir_prefix>_<best|last>. Without one,
-    --checkpoint and --out_dir must be given.
-    """
-    options = dict(DEFAULTS[section])
-    if args.config is not None:
-        run_config = load_config(args.config)
-        options = dict(run_config[section])
-        if options["checkpoint"] not in ("best", "last"):
-            parser.error(f"`{section}: checkpoint` must be best or last")
-        if args.checkpoint is None:
-            args.checkpoint = os.path.join(run_config["checkpoint_dir"], f"{options['checkpoint']}.pt")
-        if options["out_dir"] is None:
-            options["out_dir"] = os.path.join(
-                run_config["checkpoint_dir"], f"{out_dir_prefix}_{options['checkpoint']}"
-            )
-    for key in keys:
-        if getattr(args, key) is None:
-            setattr(args, key, options[key])
-    if args.checkpoint is None or args.out_dir is None:
-        parser.error("Give --config, or --checkpoint and --out_dir")
-    if args.split not in ("val", "train", "all"):
-        parser.error(f"`{section}: split` must be val, train or all")
-    if args.frame is not None and args.frame < 0:
-        parser.error("The frame must not be negative")
 
 
 def check_vae_options(config: dict):

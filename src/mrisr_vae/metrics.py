@@ -1,11 +1,8 @@
 r"""Masked image metrics for scoring predictions of a held-out view.
 
-    uv run mrisr-score --evaluation_dir <dir> --name baseline
-
-Every method should be scored by this code on the same voxels: the scoring
-mask written by `mrisr-evaluate --save_predictions` (the voxels the held-out
-view's forward model supports, and with `region`, only those inside the
-bounding stack: see `evaluate`). Predictions are compared in raw intensities.
+Every method is scored by this code on the same voxels: the scoring mask of
+the evaluation directory (see `evaluation`). Predictions are compared in raw
+intensities.
 
 - mse:  mean squared error over the mask.
 - psnr: 10 log10(L^2 / mse), with L the target's range (max - min) over the
@@ -19,20 +16,10 @@ bounding stack: see `evaluate`). Predictions are compared in raw intensities.
         windows that lie entirely inside the mask. Predictions are only defined
         inside the mask, so a window reaching outside it would compare against
         nothing.
-
-`mrisr-score` scores files saved next to `mrisr-evaluate`'s: in
-<evaluation_dir>/<conditioning>/<subject>/, for each <view>_target.nii.gz and
-<view>_mask.nii.gz there, the prediction <view>_pred_<name>.nii.gz. Save a
-baseline's predictions there (on the same image grid, for the frame in the
-target's header `toffset`) to score it with exactly the same code.
 """
 
-import argparse
-import csv
 import math
-from pathlib import Path
 
-import nibabel as nib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -120,57 +107,3 @@ def masked_spearman(a, b, mask) -> float:
         return math.nan
     return float(np.corrcoef(_average_ranks(x), _average_ranks(y))[0, 1])
 
-
-def score_directory(evaluation_dir, name: str) -> list[dict]:
-    r"""Scores every <view>_pred_<name>.nii.gz under `evaluation_dir` against
-    the target and mask saved beside it."""
-    rows = []
-    for target_path in sorted(Path(evaluation_dir).glob("*/*/*_target.nii.gz")):
-        view = target_path.name[: -len("_target.nii.gz")]
-        subject_dir = target_path.parent
-        prediction_path = subject_dir / f"{view}_pred_{name}.nii.gz"
-        if not prediction_path.exists():
-            print(f"Missing {prediction_path}")
-            continue
-        target = nib.load(str(target_path))
-        prediction = nib.load(str(prediction_path))
-        if prediction.shape != target.shape or not np.allclose(prediction.affine, target.affine, atol=1e-3):
-            raise ValueError(f"{prediction_path} is not on the target's image grid")
-        mask = nib.load(str(subject_dir / f"{view}_mask.nii.gz")).get_fdata()
-        metrics = masked_metrics(prediction.get_fdata(), target.get_fdata(), mask)
-        rows.append(
-            {
-                "conditioning": subject_dir.parent.name,
-                "subject": subject_dir.name,
-                "view": view,
-                "frame": float(target.header["toffset"]),
-                **metrics,
-            }
-        )
-    return rows
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--evaluation_dir", required=True, help="An mrisr-evaluate --save_predictions out_dir")
-    parser.add_argument("--name", required=True, help="Scores <view>_pred_<name>.nii.gz, e.g. baseline, direct")
-    parser.add_argument("--out", help="Default: <evaluation_dir>/scores_<name>.csv")
-    args = parser.parse_args(argv)
-    rows = score_directory(args.evaluation_dir, args.name)
-    if not rows:
-        print("Nothing to score")
-        return
-    out = args.out or str(Path(args.evaluation_dir) / f"scores_{args.name}.csv")
-    with open(out, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    for conditioning in sorted({row["conditioning"] for row in rows}):
-        selected = [row for row in rows if row["conditioning"] == conditioning]
-        means = ", ".join(f"{key} {np.nanmean([row[key] for row in selected]):.4g}" for key in ("mse", "psnr", "ssim"))
-        print(f"{conditioning}: {len(selected)} predictions; mean {means}")
-    print(f"Wrote {out}")
-
-
-if __name__ == "__main__":
-    main()

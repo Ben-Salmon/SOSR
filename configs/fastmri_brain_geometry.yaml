@@ -1,14 +1,14 @@
-# Copy of diffusion-priors/latent_image_geometry/kaggle_cmr_train.yaml, so that
-# the two models super-resolve onto the same grid.
+# The fastMRI brain grid. To size a grid for new data, run mrisr-latent-extent
+# --dataset brain (slurm/latent-extent.sh). For this grid, diffusion-priors'
+# equivalent script reported:
 #
-# SU per vox:  [0.6875 0.6875 5.    ]
-# Lowest coords su:  [ -94.21507035 -100.29713317  -46.59431439]
-# Highest coords su:  [ 94.64871746 108.07604572  32.06574384]
-# Size su:  [188.86378782 208.37317889  78.66005823]
+# Median mm per voxel:  [0.6875 0.6875 5.    ]
+# ROI lowest coordinate, 10th percentile (SU):  [ -94.21507035 -100.29713317  -46.59431439]
+# ROI highest coordinate, 90th percentile (SU):  [ 94.64871746 108.07604572  32.06574384]
+# ROI size (SU):  [188.86378782 208.37317889  78.66005823]
 
 
-# The only views training loads. la_4ch is held out for evaluation
-# (data: heldout_views in kaggle_cmr.yaml) and must stay out of this list.
+# The only view training loads.
 VIEWS: ["ax"]
 SCALE_FACTOR: 1
 RAW_SU_PER_LVOX: 0.75

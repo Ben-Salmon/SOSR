@@ -1,12 +1,12 @@
 #!/bin/bash --login
 #SBATCH -J mrisr-vae-smore
 #SBATCH -o logs/%x-%A_%a.out   # one log per stack, relative to the submission directory (the repo root)
+#SBATCH -p gpuL
 #SBATCH -n 1
 #SBATCH -c 8               # SMORE's DataLoader uses 8 workers
-#SBATCH --time=01:00:00           # per stack; time one stack first (--array=1) and adjust
+#SBATCH -t 0-1             # per stack; time one stack first (--array=1) and adjust
+#SBATCH -G 1
 #SBATCH --mem=16G
-#SBATCH --partition=gpuq
-#SBATCH --gres=gpu:1
 
 # SMORE (unmodified, default options) on one short-axis stack per array task:
 # line $SLURM_ARRAY_TASK_ID of the stacks.txt that `mrisr-baselines export`
@@ -15,14 +15,15 @@
 # Stacks already done are skipped, so the array can be resubmitted after
 # failures.
 #
-# SMORE is pip-installed for the cluster's Python module, not into this repo's
-# environment. Install it from GitLab: the `smore` on PyPI is an unrelated package.
-#   module load python/3.11.9
-#   pip install --user git+https://gitlab.com/iacl/smore
+# SMORE runs in its own environment, not this repo's. Install it once, from
+# the clone in ~/smore (the `smore` on PyPI is an unrelated package):
+#   uv venv --python 3.11 ~/smore/.venv
+#   uv pip install --python ~/smore/.venv ~/smore
+# Set SMORE_VENV to use another environment.
 #
 # Submit from the repo root, e.g. (N = wc -l < stacks.txt):
-#   sbatch --array=1 slurm/smore.sh ../scratch/smore/test/stacks.txt        (timing)
-#   sbatch --array=1-N%20 slurm/smore.sh ../scratch/smore/test/stacks.txt
+#   sbatch --array=1 slurm/smore.sh ../scratch/smore/kaggle_cmr_test/stacks.txt        (timing)
+#   sbatch --array=1-N%20 slurm/smore.sh ../scratch/smore/kaggle_cmr_test/stacks.txt
 if [ $# -lt 1 ]; then
     echo "Usage: sbatch --array=1-N slurm/smore.sh <stacks.txt>" >&2
     exit 1
@@ -41,19 +42,18 @@ if [ -f "$out" ]; then
     echo "$out exists; skipping"
     exit 0
 fi
-module load python/3.11.9
+module purge
 
-# SMORE's commands are console scripts, not modules, so `python -m` cannot
-# run them. run-smore calls smore-train and smore-test by name, so all three
-# must be on PATH; `pip install --user` puts them in the user base's bin.
-export PATH="$(python -m site --user-base)/bin:$PATH"
+# run-smore calls smore-train and smore-test by name, so all three must be on PATH.
+venv=${SMORE_VENV:-$HOME/smore/.venv}
+export PATH="$venv/bin:$PATH"
 for cmd in run-smore smore-train smore-test; do
     if ! command -v "$cmd" > /dev/null; then
-        echo "$cmd not found: pip install --user git+https://gitlab.com/iacl/smore (see above)" >&2
+        echo "$cmd not found in $venv/bin: install SMORE (see the top of this script)" >&2
         exit 1
     fi
 done
-version=$(python -c "from importlib.metadata import version; print(version('smore'))")
+version=$("$venv/bin/python" -c "from importlib.metadata import version; print(version('smore'))")
 echo "SMORE $version ($(command -v run-smore)) on $stack"
 start=$(date +%s)
 srun run-smore --in-fpath "$stack" --out-dir "$out_dir"

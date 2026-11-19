@@ -291,7 +291,7 @@ class CMRObservationDataset(Dataset):
                     "Warning: registration_params.pickle does not record the "
                     "breathhold corrections it was built with, so it cannot be "
                     "checked against the *_affine_correction.npy files. "
-                    "Regenerate it (diffusion-priors/registration/get_registration_params.sh) "
+                    "Regenerate it (mrisr-register: slurm/register.sh) "
                     "after any rerun of the correction."
                 )
                 self._warned_unrecorded_correction = True
@@ -301,7 +301,7 @@ class CMRObservationDataset(Dataset):
             raise RuntimeError(
                 f"{subject}/{view}: registration_params.pickle was built with a "
                 "different breathhold correction than the one on disk. Rerun "
-                "diffusion-priors/registration/get_registration_params.sh."
+                "mrisr-register (slurm/register.sh)."
             )
 
     def _choose_frame(self, subject: str, images: dict) -> tuple[bool, int | None]:
@@ -432,7 +432,7 @@ class CMRObservationDataset(Dataset):
                 "image_shape": tuple(int(s) for s in images[view].shape[:3]),
                 "image_affine": torch.as_tensor(images[view].affine),
                 # The whole acquired grid, not the crop: e.g. where a short-axis
-                # stack reaches (`evaluate.stack_region`).
+                # stack reaches (`evaluation.conditioning.stack_region`).
                 "geometry": view_geometry(observation[view]),
             }
         if not any(d["input"] for d in item_views.values()):

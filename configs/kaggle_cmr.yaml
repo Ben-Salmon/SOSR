@@ -17,20 +17,20 @@ data:
   # mrisr-train refuses to start if one is also in the geometry's VIEWS.
   heldout_views: [la_4ch]
   # Set from tests/memory-probe.sh
-  batch_size: 2
+  batch_size: 1
   num_workers: 8
 
 model:
   n_layers: 8
-  z_dim: 64
+  z_dim: 128
   # Set from tests/memory-probe.sh
-  n_filters: 64
+  n_filters: 128
   blocks_per_layer: 1
   # auto: as COSDD's get_models, from the latent size (83 -> 5 halvings, top
   # latent 3^3 of the padded 96^3). Or explicit per layer, e.g. [0, 1, 0, 1, 0, 1, 0, 1].
   downsampling: auto
   scale_initialisation: false
-  checkpointed: true
+  checkpointed: false
   # A UNet trained alongside to predict E[x | y] in one pass (COSDD's direct
   # denoiser). Trained after the VAE's graph is freed, so it adds time per
   # step but peak memory is the larger of the two networks', not their sum.
@@ -54,14 +54,14 @@ train:
   lr_warmup_steps: 100
   # About 25 epochs (315 batches / grad_batches 4 = ~79 steps per epoch).
   kl_warmup_steps: 2000
-  grad_batches: 4
+  grad_batches: 16
   clip: 1.0
   # Raise (e.g. 0.01) if the per-layer KL in wandb shows collapsed layers.
   free_bits: 0.0
   free_bits_epochs: 20
   max_epochs: 1000
   # Under the SLURM time limit, so the job stops cleanly and --resume carries on.
-  max_hours: 100
+  max_hours: 24
   patience: 50
   plateau_patience: 20
   plateau_factor: 0.1
@@ -77,7 +77,7 @@ wandb:
 predict:
   # best: lowest val/nelbo (epoch 295). last: epoch 345, whose direct
   # predictor was reinitialised on resume at epoch 317.
-  checkpoint: best
+  checkpoint: last
   out_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
   data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
   # all: every subject of data_dir. val/train: the split of data_dir by split_seed.
@@ -87,30 +87,6 @@ predict:
   # (the validation frame).
   frame: 0
   # direct, sampling or both
-  method: sampling
+  method: direct
   n_samples: 64
   save_samples: false
-
-# mrisr-evaluate --config only (sbatch slurm/evaluate.sh <this config>).
-# The same subjects, frames and conditioning sets as kaggle_cmr_direct.yaml
-# and kaggle_cmr_supervised.yaml, so their metrics.csv files compare row by row.
-evaluate:
-  checkpoint: best
-  out_dir: ../scratch/checkpoints/kaggle_cmr/evaluation_test_best
-  # The test set, which no model has seen (the supervised baseline was
-  # early-stopped on the validation subjects' la_4ch): all its subjects.
-  data_dir: /mnt/iusers01/fatpou01/bmh01/r99257bs/scratch/data/kaggle_niftis/test
-  conditioning_views: [all, sa, la_2ch]
-  # null: a frame fixed per subject, the same for every model.
-  frame: null
-  # ~13% relative error on the per-voxel std behind spearman_std_error.
-  n_samples: 32
-  seed: 0
-  save_predictions: false
-  # Only the samples: their mean is scored and their spread is the std. The
-  # direct predictor is evaluated with kaggle_cmr_direct.yaml.
-  direct: false
-  # Score la_4ch only inside the tallest short-axis stack (highest index
-  # breaking ties): the atria above it are in no training view's data. The
-  # same voxels for every model and conditioning set.
-  region: sa

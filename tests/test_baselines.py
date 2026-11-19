@@ -5,19 +5,21 @@ SMORE itself is not run: its output is faked on a grid twice as fine through
 the slices, with the affine SMORE would write, to test how it is read.
 """
 
-import argparse
 import csv
 import json
 
 import nibabel as nib
 import numpy as np
+import pytest
 import torch
+import yaml
 
-from mrisr_vae import baselines
 from mrisr_vae.data import load_frame, translate_slices
-from mrisr_vae.evaluate import heldout_projection, lvox_to_stack_vox, save_predictions
+from mrisr_vae.evaluation import baselines
+from mrisr_vae.evaluation.conditioning import heldout_projection, lvox_to_stack_vox
+from mrisr_vae.evaluation.protocol import load_protocol
+from mrisr_vae.evaluation.score import score_directory
 from mrisr_vae.forward_model import apply_affine
-from mrisr_vae.metrics import score_directory
 
 from synthetic import GEOMETRY_CONFIG, geometry, write_subject
 
@@ -44,17 +46,29 @@ def write_ramp_subject(data_dir, sa_correction=None):
     return subject
 
 
-def write_checkpoint(tmp_path):
-    path = tmp_path / "model.pt"
-    torch.save({"geometry_config": dict(GEOMETRY_CONFIG, VIEWS=["sa_1"]), "config": {"model": {}}}, path)
-    return path
+def write_protocol(tmp_path, views=("sa_1",), **options):
+    r"""A protocol for the baselines alone: la_4ch held out, scored inside sa_first."""
+    geometry_path = tmp_path / "geometry.yaml"
+    with open(geometry_path, "w") as f:
+        yaml.safe_dump(dict(GEOMETRY_CONFIG, VIEWS=list(views)), f)
+    protocol = {
+        "out_dir": str(tmp_path / "evaluation"),
+        "data_dir": str(tmp_path / "data"),
+        "geometry": str(geometry_path),
+        "heldout_views": ["la_4ch"],
+        "region": "sa_first",
+        "conditioning_views": ["sa_first"],
+        "baselines": {"work_dir": str(tmp_path / "smore")},
+        **options,
+    }
+    path = tmp_path / "protocol.yaml"
+    with open(path, "w") as f:
+        yaml.safe_dump(protocol, f)
+    return str(path)
 
 
-def args_for(data_dir, out_dir, **overrides):
-    args = dict(
-        data_dir=str(data_dir), out_dir=str(out_dir), view="la_4ch", subjects=None, max_subjects=None, frame=None
-    )
-    return argparse.Namespace(**{**args, **overrides})
+def run(command, protocol_path, *options):
+    baselines.main([command, "--protocol", protocol_path, "--device", "cpu", *options])
 
 
 def fake_smore(out_dir, subject, stack="sa_1"):
@@ -99,12 +113,10 @@ def test_export_writes_the_evaluated_corrected_frame(tmp_path):
     correction[5] = [-1, 0]
     subject = write_subject(tmp_path / "data", frames=(5, 3), views=VIEWS, sa_correction=correction)
     out_dir = tmp_path / "smore"
-    baselines.main(
-        ["export", "--checkpoint", str(write_checkpoint(tmp_path)), "--data_dir", str(tmp_path / "data"),
-         "--out_dir", str(out_dir), "--device", "cpu"]
-    )
+    protocol_path = write_protocol(tmp_path)
+    run("export", protocol_path)
 
-    dataset = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geometry(views=["sa_1"]))
+    dataset = baselines.evaluation_dataset(load_protocol(protocol_path))
     frame = dataset[0]["frame"]
     with open(out_dir / subject.name / "manifest.json") as f:
         assert json.load(f) == {"subject": subject.name, "frame": frame, "stack": "sa_1"}
@@ -120,11 +132,8 @@ def test_export_writes_only_the_lowest_numbered_stack(tmp_path):
     data_dir = tmp_path / "data"
     write_subject(data_dir, name="both", views=("sa_1", "sa_2", "la_4ch"), frames=(5, 3, 4))
     write_subject(data_dir, name="no_sa_1", views=("sa_2", "la_4ch"), frames=(3, 4))
-    checkpoint = tmp_path / "model.pt"
-    torch.save({"geometry_config": dict(GEOMETRY_CONFIG, VIEWS=["sa_1", "sa_2"]), "config": {"model": {}}}, checkpoint)
     out_dir = tmp_path / "smore"
-    baselines.main(["export", "--checkpoint", str(checkpoint), "--data_dir", str(data_dir), "--out_dir", str(out_dir),
-                    "--device", "cpu"])
+    run("export", write_protocol(tmp_path, views=("sa_1", "sa_2")))
     for name, stack in (("both", "sa_1"), ("no_sa_1", "sa_2")):
         assert sorted(p.name for p in (out_dir / name).glob("*.nii.gz")) == [f"{stack}.nii.gz"]
         with open(out_dir / name / "manifest.json") as f:
@@ -136,10 +145,9 @@ def test_every_source_recovers_a_ramp_on_the_latent_grid(tmp_path):
     geom = geometry(views=["sa_1"])
     subject = write_ramp_subject(tmp_path / "data")
     out_dir = tmp_path / "smore"
-    args = args_for(tmp_path / "data", out_dir)
-    dataset = baselines.evaluation_dataset(args, geom)
-    item = dataset[0]
-    baselines.export(args, geom)
+    protocol_path = write_protocol(tmp_path)
+    item = baselines.evaluation_dataset(load_protocol(protocol_path))[0]
+    run("export", protocol_path)
     fake_smore(out_dir, subject.name)
 
     vox = apply_affine(lvox_to_stack_vox(item, "sa_1", geom), baselines.latent_coords(geom).T).T
@@ -157,21 +165,17 @@ def test_project_writes_scorable_predictions(tmp_path):
     geom = geometry(views=["sa_1"])
     subject = write_ramp_subject(tmp_path / "data")
     out_dir = tmp_path / "smore"
-    checkpoint = write_checkpoint(tmp_path)
-    common = ["--checkpoint", str(checkpoint), "--data_dir", str(tmp_path / "data"), "--out_dir", str(out_dir),
-              "--device", "cpu"]
-    baselines.main(["export", *common])
+    protocol_path = write_protocol(tmp_path)
+    run("export", protocol_path)
     fake_smore(out_dir, subject.name)
+    run("project", protocol_path)
 
-    # What mrisr-evaluate --save_predictions --conditioning_views sa_first --region sa_first writes.
-    evaluation_dir = tmp_path / "evaluation"
-    dataset = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geom)
-    item = dataset[0]
+    # The target and mask the models are scored on, written by project itself.
+    item = baselines.evaluation_dataset(load_protocol(protocol_path))[0]
     projection = heldout_projection(item, "la_4ch", geom, region="sa_first")
-    subject_dir = evaluation_dir / "sa_first" / subject.name
-    save_predictions(str(subject_dir), item, "la_4ch", {}, projection.target, projection.mask)
-
-    baselines.main(["project", *common, "--evaluation_dir", str(evaluation_dir)])
+    subject_dir = tmp_path / "evaluation" / "sa_first" / subject.name
+    mask = nib.load(str(subject_dir / "la_4ch_mask.nii.gz")).get_fdata()
+    assert mask.sum() == projection.mask.sum()
     for source in baselines.SOURCES:
         saved = nib.load(str(subject_dir / f"la_4ch_pred_{source}.nii.gz"))
         assert saved.header["toffset"] == item["frame"]
@@ -180,37 +184,40 @@ def test_project_writes_scorable_predictions(tmp_path):
         on_grid = saved.get_fdata()[tuple(slice(s, s + n) for s, n in zip(item["views"]["la_4ch"]["crop_start"],
                                                                          expected.shape))]
         assert np.allclose(on_grid, expected.numpy(), atol=1e-3)
-        rows = score_directory(evaluation_dir, source)
-        assert len(rows) == 1 and np.isfinite(rows[0]["psnr"])
+    rows = score_directory(tmp_path / "evaluation")
+    assert sorted(row["method"] for row in rows) == sorted(baselines.SOURCES)
+    assert all(np.isfinite(row["psnr"]) for row in rows)
+    with open(tmp_path / "evaluation" / "runs" / "cubic.csv") as f:
+        (row,) = list(csv.DictReader(f))
+    assert row["conditioning_views"] == "sa_1" and row["region_stack"] == "sa_1"
+    # Run again, it checks the target and mask instead of rewriting them.
+    run("project", protocol_path, "--sources", "linear")
 
 
 def test_project_skips_subjects_without_smore_output(tmp_path, capsys):
-    geom = geometry(views=["sa_1"])
     subject = write_ramp_subject(tmp_path / "data")
-    out_dir = tmp_path / "smore"
-    common = ["--checkpoint", str(write_checkpoint(tmp_path)), "--data_dir", str(tmp_path / "data"),
-              "--out_dir", str(out_dir), "--device", "cpu"]
-    baselines.main(["export", *common])
-    evaluation_dir = tmp_path / "evaluation"
-    dataset = baselines.evaluation_dataset(args_for(tmp_path / "data", out_dir), geom)
-    item = dataset[0]
-    projection = heldout_projection(item, "la_4ch", geom, region="sa_first")
-    save_predictions(str(evaluation_dir / "sa_first" / subject.name), item, "la_4ch", {}, projection.target, projection.mask)
-
-    baselines.main(["project", *common, "--evaluation_dir", str(evaluation_dir)])
-    assert (evaluation_dir / "sa_first" / subject.name / "la_4ch_pred_cubic.nii.gz").is_file()
-    assert not (evaluation_dir / "sa_first" / subject.name / "la_4ch_pred_smore.nii.gz").exists()
+    protocol_path = write_protocol(tmp_path)
+    run("export", protocol_path)
+    run("project", protocol_path)
+    subject_dir = tmp_path / "evaluation" / "sa_first" / subject.name
+    assert (subject_dir / "la_4ch_pred_cubic.nii.gz").is_file()
+    assert not (subject_dir / "la_4ch_pred_smore.nii.gz").exists()
     assert "no SMORE output" in capsys.readouterr().out
+
+
+def test_baselines_need_their_protocol_section(tmp_path):
+    write_ramp_subject(tmp_path / "data")
+    with pytest.raises(SystemExit):
+        run("export", write_protocol(tmp_path, baselines=None))
 
 
 def test_check_finds_smore_best_aligned_unshifted(tmp_path):
     subject = write_ramp_subject(tmp_path / "data")
     out_dir = tmp_path / "smore"
-    common = ["--checkpoint", str(write_checkpoint(tmp_path)), "--data_dir", str(tmp_path / "data"),
-              "--out_dir", str(out_dir), "--device", "cpu"]
-    baselines.main(["export", *common])
+    protocol_path = write_protocol(tmp_path)
+    run("export", protocol_path)
     fake_smore(out_dir, subject.name)
-    baselines.main(["check", *common])
+    run("check", protocol_path)
 
     with open(out_dir / "check.csv") as f:
         rows = list(csv.DictReader(f))

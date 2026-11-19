@@ -36,7 +36,37 @@ from .data import NORMALISED_STD, CMRObservationDataset, collate, split_subjects
 from .forward_model import invert_affine
 from .geometry import LatentGeometry
 from .model import build_model
-from .train import options_from_config
+from .train import DEFAULTS, load_config
+
+
+def options_from_config(parser, args, keys):
+    r"""Fills the options `keys` of `args` left unset (None) on the command
+    line from the `predict` section of `args.config`, or from its defaults
+    without a config.
+
+    With a config, the checkpoint defaults to <checkpoint_dir>/<best|last>.pt
+    and out_dir to <checkpoint_dir>/predictions_<best|last>. Without one,
+    --checkpoint and --out_dir must be given.
+    """
+    options = dict(DEFAULTS["predict"])
+    if args.config is not None:
+        run_config = load_config(args.config)
+        options = dict(run_config["predict"])
+        if options["checkpoint"] not in ("best", "last"):
+            parser.error("`predict: checkpoint` must be best or last")
+        if args.checkpoint is None:
+            args.checkpoint = os.path.join(run_config["checkpoint_dir"], f"{options['checkpoint']}.pt")
+        if options["out_dir"] is None:
+            options["out_dir"] = os.path.join(run_config["checkpoint_dir"], f"predictions_{options['checkpoint']}")
+    for key in keys:
+        if getattr(args, key) is None:
+            setattr(args, key, options[key])
+    if args.checkpoint is None or args.out_dir is None:
+        parser.error("Give --config, or --checkpoint and --out_dir")
+    if args.split not in ("val", "train", "all"):
+        parser.error("`predict: split` must be val, train or all")
+    if args.frame is not None and args.frame < 0:
+        parser.error("The frame must not be negative")
 
 
 def save_volume(volume, affine, frame, path):
@@ -69,7 +99,7 @@ def main(argv=None):
 
     # Command line, then the config's predict section, then its defaults.
     keys = ("out_dir", "data_dir", "split", "frame", "method", "n_samples", "save_samples")
-    options_from_config(parser, args, "predict", keys, out_dir_prefix="predictions")
+    options_from_config(parser, args, keys)
     if args.method not in ("direct", "sampling", "both"):
         parser.error("`predict: method` must be direct, sampling or both")
     sampling = args.method in ("sampling", "both")
