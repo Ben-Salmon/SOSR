@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, random_split
 
 from .forward_model import apply_affine, bound_y_coords, build_view_operator, invert_affine
 from .geometry import LatentGeometry
+from .preprocess.intensity_gain import load_intensity_gain
 
 # Views are normalised jointly to this standard deviation inside the latent,
 # as in diffusion-priors.
@@ -196,18 +197,23 @@ class CMRObservationDataset(Dataset):
 
         subject, frame, mm_to_su_affine, norm_mean, norm_std, norm_views,
         views: {view: {y, sigma_meas, sigma_extra, op, input,
-                       crop_start, image_shape, image_affine}} in `views` order
+                       crop_start, image_shape, image_affine,
+                       intensity_gain}} in `views` order
 
     where `y` is (1, 1, n_y0, n_y1, n_y2), `op` the `build_view_operator`
     tensors, and the noise standard deviations are in normalised units.
     `crop_start` places y in the view's image, of shape `image_shape` and with
-    the NIfTI file's own affine `image_affine`. `input` is False for a view
+    the NIfTI file's own affine `image_affine`. A view with an
+    `<view>_intensity_gain.json` (`mrisr-intensity-gain`) is multiplied by its
+    `intensity_gain`, as are its noise standard deviations, before the joint
+    normalisation; other views have gain 1. `input` is False for a view
     dropped from the encoder's input (see `view_drop_probability`).
 
     Arguments:
         subjects: Subject names in `data_dir`. Defaults to all usable subjects.
         extra_noise_std: Extra noise standard deviation by view, in the raw
-            intensity units of the data, as in diffusion-priors. Unlike there,
+            intensity units of the data, as in diffusion-priors (scaled by
+            the view's intensity gain along with it). Unlike there,
             no noise is added to y: it only enters the likelihood.
         views: The views to load. Defaults to the geometry's. Views outside the
             geometry's (held-out views, for evaluation) come after the
@@ -352,8 +358,10 @@ class CMRObservationDataset(Dataset):
         crops = {}
         starts = {}
         insides = {}
+        gains = {}
         for view, img in images.items():
-            data = load_frame(img, frame)  # [X, Y, Z]
+            gains[view] = load_intensity_gain(subject_path, view)
+            data = load_frame(img, frame) * gains[view]  # [X, Y, Z]
             correction_file = subject_path / f"{view}_affine_correction.npy"
             if correction_file.is_file():
                 correction = np.load(correction_file)
@@ -420,7 +428,9 @@ class CMRObservationDataset(Dataset):
                 noise_std = float(torch.as_tensor(torch.load(noise_std_file, map_location="cpu")))
             else:
                 noise_std = 0.0
-            extra_noise_std = float(self.extra_noise_std.get(view, 0.0))
+            # Both in the view's raw units, which its gain rescales.
+            noise_std *= gains[view]
+            extra_noise_std = float(self.extra_noise_std.get(view, 0.0)) * gains[view]
             y = (y - norm_mean) / norm_std * NORMALISED_STD
             item_views[view] = {
                 "y": y[None].to(torch.float32).contiguous(),  # [1, C, X', Y', Z']
@@ -434,6 +444,7 @@ class CMRObservationDataset(Dataset):
                 # The whole acquired grid, not the crop: e.g. where a short-axis
                 # stack reaches (`evaluation.conditioning.stack_region`).
                 "geometry": view_geometry(observation[view]),
+                "intensity_gain": gains[view],
             }
         if not any(d["input"] for d in item_views.values()):
             return None

@@ -67,6 +67,7 @@ over after breathhold correction.
 src/mrisr_vae/
   preprocess/        before training
     breathhold/      mrisr-breathhold: slice alignment (Stolt-Ansó et al., see its README)
+    intensity_gain.py mrisr-intensity-gain: long-axis intensity gains
     registration.py  mrisr-register: registration_params.pickle per subject
     heart_roi.py     the heart's bounding box (Zambal et al. 2008), for the centre of mass
     latent_extent.py mrisr-latent-extent: how big to make the latent grid
@@ -110,7 +111,16 @@ Submit every job from the repository root. Each one writes
    slice of a subject by matching intensities where they intersect; writes
    `<subject>/<view>_affine_correction.npy`. Once per directory:
    `sbatch slurm/breathhold.sh --data_dir ../scratch/data/kaggle_niftis/train` (and `test`).
-2. **Registration.** Writes `<subject>/registration_params.pickle`: each
+2. **Intensity gains** (CMR only). Each series is scaled on its own, so a
+   long-axis view can be ~10-15% darker than the short-axis slices at the
+   same anatomy, while the forward model slices one volume into both.
+   Estimates each long-axis view's gain relative to the short-axis slices
+   where they intersect, with the breathhold correction applied; writes
+   `<subject>/<view>_intensity_gain.json`, which the dataset multiplies the
+   view and its noise level by. After step 1, once per directory:
+   `sbatch slurm/intensity-gain.sh --data_dir ../scratch/data/kaggle_niftis/train` (and `test`).
+   Rerun it whenever the breathhold correction is rerun.
+3. **Registration.** Writes `<subject>/registration_params.pickle`: each
    view's voxel-to-mm affine (with the correction), voxel size, slice
    thickness and size, and `mm_to_su_affine`, which puts the ROI's centre of
    mass (the heart's bounding box in the first CMR view; the bright voxels
@@ -120,7 +130,7 @@ Submit every job from the repository root. Each one writes
    correction is rerun: the dataset refuses a pickle built with other
    corrections than those on disk. `--check` writes nothing and lists the
    subjects whose parameters would change.
-3. **Latent grid size.** `sbatch slurm/latent-extent.sh --dataset cmr --data_dir <train> --su_per_lvox 1.8`
+4. **Latent grid size.** `sbatch slurm/latent-extent.sh --dataset cmr --data_dir <train> --su_per_lvox 1.8`
    prints the ROI's extent over the training subjects (10th percentile of
    the lows, 90th of the highs), the grid it suggests (`x_size_su`,
    `X_MIN_COORDS_SU`) and the size the Ladder VAE pads it to. Copy it,

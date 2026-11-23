@@ -5,7 +5,7 @@
 #SBATCH -n 16
 #SBATCH -t 0-2
 
-# Step 2: registration_params.pickle for every subject (after breathhold
+# Step 3: registration_params.pickle for every subject (after breathhold
 # correction, for CMR). Submit from the repo root, e.g.
 #   sbatch slurm/register.sh --dataset cmr --data_dirs ../scratch/data/kaggle_niftis/train ../scratch/data/kaggle_niftis/test
 #   sbatch slurm/register.sh --dataset brain --data_dirs ../scratch/data/fastmri/nifti

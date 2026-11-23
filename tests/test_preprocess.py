@@ -2,8 +2,8 @@ r"""Breathhold correction, registration and the latent extent, on synthetic
 subjects. CPU only.
 
 Where ../diffusion-priors is present, the refactored code is also checked
-against the original scripts there (registration/, breathhold_correction/):
-the same pickles and the same corrections.
+against the original scripts there (registration/):
+the same pickles.
 """
 
 import importlib
@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from mrisr_vae.data import CMRObservationDataset, translate_slices
-from mrisr_vae.preprocess import latent_extent, registration
+from mrisr_vae.preprocess import intensity_gain, latent_extent, registration
 from mrisr_vae.preprocess.breathhold import optimise
 from mrisr_vae.preprocess.breathhold.files import find_subjects
 from mrisr_vae.preprocess.breathhold.subject import SubjectData
@@ -182,28 +182,89 @@ def write_breathhold_subject(root: Path, name="1001", seed=0) -> Path:
     return subject
 
 
-def test_breathhold_matches_the_original(tmp_path):
-    names = ["geo_utils", "data_utils", "data_classes", "correction_utils", "metrics", "optimize_affines"]
-    new_subject = write_breathhold_subject(tmp_path / "new")
-    old_subject = write_breathhold_subject(tmp_path / "old")
-    (files,) = find_subjects(tmp_path / "new")
+# A short-axis stack and two orthogonal long-axis planes through all of its
+# slices, as in CMR, with larger fields of view than VIEW_GEOMETRY.
+MISREGISTERED_GEOMETRY = {
+    "sa_1": ((64, 64, 9), [1.5, 1.5, 6.0], None, [0.0, 0.0, 0.0]),
+    "la_4ch": ((64, 64, 1), [1.5, 1.5, 6.0], (90, 0, 15), [0.0, 0.0, 0.0]),
+    "la_2ch": ((64, 64, 1), [1.5, 1.5, 6.0], (90, 0, 105), [0.0, 0.0, 0.0]),
+}
+
+
+def write_misregistered_subject(root: Path, sa_shifts, segmented: bool, name="1001", seed=0) -> Path:
+    r"""Views sampled from one volume -- random blobs and an ellipsoidal heart --
+    with each short-axis slice's content displaced by `sa_shifts` (n_slices, 2)
+    voxels, so that its correct breathhold correction is `sa_shifts`. With
+    `segmented`, heart segmentations of sa_1 and la_4ch (none for la_2ch)."""
+    subject = Path(root) / name
+    subject.mkdir(parents=True)
+    rng = np.random.default_rng(seed)
+    centres = rng.uniform(-35, 35, (60, 3))
+    widths = rng.uniform(3, 8, 60)
+    amplitudes = rng.uniform(0.5, 1.5, 60)
+
+    def volume(points):
+        d2 = ((points[..., None, :] - centres) ** 2).sum(-1)
+        # A soft edge, about 4 mm wide, like a partial-volumed one.
+        radius = np.sqrt((((points - [3.0, -2.0, 0.0]) / [16.0, 13.0, 30.0]) ** 2).sum(-1))
+        heart = 1 / (1 + np.exp((radius - 1) / 0.15))
+        image = 100 * (amplitudes * np.exp(-d2 / (2 * widths**2))).sum(-1) + 150 * heart
+        return image, (heart > 0.5).astype(np.float32)
+
+    for view, (shape, spacing, angles, centre) in MISREGISTERED_GEOMETRY.items():
+        axes = np.eye(3) if angles is None else rotation(*angles)
+        affine = grid_affine(shape, spacing, axes, centre)
+        i, j, k = np.meshgrid(*(np.arange(n, dtype=float) for n in shape), indexing="ij")
+        if view.startswith("sa"):
+            i = i + np.asarray(sa_shifts)[None, None, :, 0]
+            j = j + np.asarray(sa_shifts)[None, None, :, 1]
+        points = np.stack([i, j, k, np.ones_like(i)], axis=-1) @ affine.T
+        image, heart = volume(points[..., :3])
+        nib.save(nib.Nifti1Image(image[..., None].repeat(2, axis=-1), affine), str(subject / f"{view}.nii.gz"))
+        if segmented and view == "sa_1":
+            nib.save(nib.Nifti1Image(heart, affine), str(subject / "seg_sa_ED.nii.gz"))
+        if segmented and view == "la_4ch":
+            nib.save(nib.Nifti1Image(heart, affine), str(subject / "seg_la_4ch_ED.nii.gz"))
+    return subject
+
+
+@pytest.mark.parametrize("segmented", [True, False])
+def test_breathhold_recovers_large_short_axis_shifts(tmp_path, segmented):
+    # Up to 6 voxels (9 mm) per slice: beyond what gradient descent on the
+    # translations reliably recovered.
+    shifts = np.random.default_rng(1).integers(-6, 7, (9, 2))
+    write_misregistered_subject(tmp_path, shifts, segmented)
+    (files,) = find_subjects(tmp_path)
     data = SubjectData(files, device="cpu")
-    optimise.optimize_affines(data, max_epochs=15, early_stop_epochs=5)
-    with old_modules(DIFFUSION_PRIORS / "breathhold_correction", names) as modules:
-        data_utils, data_classes, old = modules[1], modules[2], modules[5]
-        if old.DEVICE != "cpu":
-            pytest.skip("the original runs on the GPU when there is one")
-        (old_files,) = data_utils.find_subjects(str(tmp_path / "old"))
-        old.optimize_affines(data_classes.SubjectData(old_files), max_epochs=15, early_stop_epochs=5)
-    for view in ("sa_1", "la_4ch"):
-        new = np.load(new_subject / f"{view}_affine_correction.npy")
-        old_correction = np.load(old_subject / f"{view}_affine_correction.npy")
-        assert np.array_equal(new, old_correction), view
+    assert data.has_seg.tolist() == [segmented, False] + [segmented] * 9  # la_4ch, la_2ch, sa_1 slices.
+    result = optimise.optimize_affines(data, search_radius=8, lax_steps=50, save=False)
+    sa = np.array(["sa" in n for n in data.names])
+    recovered = result.voxel_transformations[sa, :2, 3].numpy()
+    assert np.array_equal(recovered, shifts)
+    assert result.best_loss < result.initial_loss
+
+
+def test_intensity_gain_recovers_a_darker_long_axis(tmp_path):
+    # Misregistered short-axis slices and long-axis views 20% darker: the gain
+    # is estimated on the breathhold correction saved on disk.
+    shifts = np.random.default_rng(2).integers(-4, 5, (9, 2))
+    subject = write_misregistered_subject(tmp_path, shifts, segmented=False)
+    for view in ("la_4ch", "la_2ch"):
+        image = nib.load(subject / f"{view}.nii.gz")
+        nib.save(nib.Nifti1Image(0.8 * image.get_fdata(), image.affine), str(subject / f"{view}.nii.gz"))
+    optimise.main(["--data_dir", str(tmp_path), "--search_radius", "6", "--lax_steps", "20", "--device", "cpu"])
+    intensity_gain.main(["--data_dir", str(tmp_path), "--device", "cpu"])
+    for view in ("la_4ch", "la_2ch"):
+        assert intensity_gain.load_intensity_gain(subject, view) == pytest.approx(1.25, rel=0.02), view
+    assert not intensity_gain.gain_path(subject, "sa_1").exists()
+    assert intensity_gain.load_intensity_gain(subject, "sa_1") == 1.0
 
 
 def test_breathhold_cli_writes_corrections_the_registration_reads(tmp_path):
     subject = write_breathhold_subject(tmp_path)
-    optimise.main(["--data_dir", str(tmp_path), "--max_epochs", "5", "--early_stop_epochs", "2", "--device", "cpu"])
+    optimise.main(
+        ["--data_dir", str(tmp_path), "--rounds", "1", "--search_radius", "2", "--lax_steps", "3", "--device", "cpu"]
+    )
     sa = np.load(subject / "sa_1_affine_correction.npy")
     la = np.load(subject / "la_4ch_affine_correction.npy")
     assert sa.shape == (9, 2) and np.array_equal(sa, np.round(sa)) and la.shape == (4, 4)

@@ -51,6 +51,7 @@ from ..data import NORMALISED_STD, CMRObservationDataset, load_frame, translate_
 from ..forward_model import BatchOperator, apply_affine
 from ..geometry import LatentGeometry
 from ..metrics import masked_metrics
+from ..preprocess.intensity_gain import load_intensity_gain
 from . import files
 from .conditioning import conditioning_label, heldout_projection, item_conditioning, lvox_to_stack_vox
 from .protocol import BASELINE_CONDITIONING, BASELINE_SOURCES, Protocol, load_protocol
@@ -128,9 +129,9 @@ def latent_coords(geometry: LatentGeometry) -> torch.Tensor:
 
 def corrected_frame(subject_dir: Path, stack: str, frame: int | None) -> tuple[np.ndarray, nib.Nifti1Image]:
     r"""One frame of a short-axis stack with its per-slice breathhold
-    translations applied, as `CMRObservationDataset.__getitem__` loads it."""
+    translations and intensity gain applied, as `CMRObservationDataset.__getitem__` loads it."""
     img = nib.load(str(subject_dir / f"{stack}.nii.gz"))
-    data = load_frame(img, frame)
+    data = load_frame(img, frame) * load_intensity_gain(subject_dir, stack)
     correction_file = subject_dir / f"{stack}_affine_correction.npy"
     if correction_file.is_file():
         correction = np.load(correction_file)

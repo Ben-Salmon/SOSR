@@ -10,6 +10,9 @@ import torch
 from .files import SubjectFiles, split_sax_into_slices
 from .geometry import la_plane_valid_for_sa_stack
 
+# All of a subject's intensities are divided by this percentile of its voxels.
+INTENSITY_PERCENTILE = 99.0
+
 
 @dataclass
 class OptimizableImage:
@@ -85,8 +88,6 @@ class SubjectData:
                 )
                 continue
             image_data = nii.get_fdata()[:, :, nii.shape[2] // 2][:, :, :1]  # (x, y, 1): first frame only
-            if seg is None:
-                seg = np.ones_like(image_data)
             self.planes.append(
                 OptimizableImage(image_data, nii.affine, nii.header.get_zooms()[:3], file.name.split(".")[0], seg)
             )
@@ -131,7 +132,7 @@ class SubjectData:
             ):
                 seg = sa_seg_data[:, :, slice_idx : slice_idx + 1]  # (x, y, 1)
             else:
-                seg = np.ones_like(image_data)
+                seg = None
             self.planes.append(
                 OptimizableImage(image_data, slice_nii.affine, slice_nii.header.get_zooms()[:3], name, seg)
             )
@@ -139,7 +140,13 @@ class SubjectData:
         assert min([min(i) for i in self.idx_pairs]) == 0
         assert max([max(i) for i in self.idx_pairs]) == len(self.planes) - 1
 
-        images = [torch.tensor(p.image, dtype=torch.float32, device=device) for p in self.planes]
+        # Intensities scaled to about [0, 1], so that the loss's intensity and
+        # segmentation terms have similar sizes. One factor for the whole
+        # subject: a factor per view would depend on what each field of view
+        # contains, and so make views that agree disagree.
+        voxels = np.concatenate([p.image.ravel() for p in self.planes])
+        scale = max(float(np.percentile(voxels, INTENSITY_PERCENTILE)), 1e-8)
+        images = [torch.tensor(p.image / scale, dtype=torch.float32, device=device) for p in self.planes]
         self.shapes = torch.stack([torch.tensor(i.shape, dtype=torch.int64, device=device) for i in images])
         self.affines = torch.stack(
             [torch.tensor(p.affine, dtype=torch.float32, device=device) for p in self.planes], dim=0
@@ -152,10 +159,45 @@ class SubjectData:
         self.images_pad = torch.zeros((len(images), *max_im_shape), dtype=torch.float32, device=device)
         for i, (im, sh) in enumerate(zip(images, self.shapes)):
             self.images_pad[i, : sh[0], : sh[1]] = im
-        segs = [torch.tensor(p.seg, dtype=torch.float32, device=device) for p in self.planes]
+        # Binary heart masks; all zero for a plane without a segmentation, which
+        # `has_seg` marks.
+        self.has_seg = torch.tensor([p.seg is not None for p in self.planes], dtype=torch.bool, device=device)
+        segs = [
+            torch.tensor(
+                np.zeros_like(p.image) if p.seg is None else (p.seg > 0.5), dtype=torch.float32, device=device
+            )
+            for p in self.planes
+        ]
         self.segs_pad = torch.zeros((len(segs), *max_im_shape), dtype=torch.float32, device=device)
         for i, (seg, sh) in enumerate(zip(segs, self.shapes)):
             self.segs_pad[i, : sh[0], : sh[1]] = seg
+
+    def load_voxel_transformations(self) -> tuple[torch.Tensor, list[str]]:
+        r"""The corrections saved by `save_transformations`, as (n_planes, 4, 4)
+        voxel transforms (corrected affines are affines @ these), and the views
+        with no usable file, which are left uncorrected."""
+        transforms = torch.eye(4, dtype=self.affines.dtype, device=self.affines.device).repeat(len(self.planes), 1, 1)
+        missing, loaded, slice_counts = set(), {}, {}
+        for i, plane in enumerate(self.planes):
+            name = plane.name
+            if name not in loaded:
+                path = self.subject_path / f"{name}_affine_correction.npy"
+                loaded[name] = np.load(path) if path.is_file() else None
+            correction = loaded[name]
+            if correction is None:
+                missing.add(name)
+            elif "sa" not in name:
+                transforms[i] = torch.as_tensor(correction, dtype=transforms.dtype)
+            else:
+                k = slice_counts.get(name, 0)
+                slice_counts[name] = k + 1
+                if correction.ndim != 2 or k >= len(correction):
+                    missing.add(name)  # A file from a stack with a different number of slices.
+                else:
+                    transforms[i, :2, 3] = torch.as_tensor(correction[k], dtype=transforms.dtype)
+        for name in missing:
+            transforms[[i for i, p in enumerate(self.planes) if p.name == name]] = torch.eye(4, dtype=transforms.dtype)
+        return transforms, sorted(missing)
 
     def save_transformations(self, transformations: list[torch.Tensor]):
         r"""Writes <subject>/<view>_affine_correction.npy: a (4, 4) voxel

@@ -9,7 +9,8 @@ r"""The evaluation directory: one per protocol, shared by every method.
     <out_dir>/scores.csv, summary.csv             `mrisr-score`
 
 Every file is on the held-out view's own image grid (its NIfTI affine and
-shape), in raw intensities, for the evaluated frame (header toffset).
+shape), in raw intensities (times the view's intensity gain, if it has one),
+for the evaluated frame (header toffset).
 Whichever job comes first writes the target and mask; every later one
 recomputes them and refuses to go on if they differ, so all methods are scored
 on the same frame and voxels.

@@ -107,6 +107,25 @@ def test_normalisation_can_ignore_a_view(tmp_path):
     assert mixed["norm_mean"] != alone["norm_mean"]
 
 
+def test_intensity_gain_scales_a_view_and_its_noise(tmp_path):
+    subject = write_subject(tmp_path)
+    torch.save(torch.tensor(3.0), subject / "la_2ch_noise_std.pt")
+    geom = geometry()
+    kwargs = dict(views=["sa_1", "la_2ch"], norm_views=["sa_1"], frame=1, extra_noise_std=EXTRA)
+    plain = CMRObservationDataset(tmp_path, geom, **kwargs)[0]
+    (subject / "la_2ch_intensity_gain.json").write_text('{"gain": 2.0}')
+    scaled = CMRObservationDataset(tmp_path, geom, **kwargs)[0]
+    # Normalised by sa_1 alone, so the normalisation is unchanged.
+    assert scaled["norm_mean"] == plain["norm_mean"] and scaled["norm_std"] == plain["norm_std"]
+    offset = scaled["norm_mean"] / scaled["norm_std"] * 0.8
+    la, la_plain = scaled["views"]["la_2ch"], plain["views"]["la_2ch"]
+    assert torch.allclose(la["y"], 2 * la_plain["y"] + offset, atol=1e-4)
+    assert la["intensity_gain"] == 2.0 and scaled["views"]["sa_1"]["intensity_gain"] == 1.0
+    assert la["sigma_meas"] == pytest.approx(2 * la_plain["sigma_meas"])
+    assert la["sigma_extra"] == pytest.approx(2 * la_plain["sigma_extra"])
+    assert torch.equal(scaled["views"]["sa_1"]["y"], plain["views"]["sa_1"]["y"])
+
+
 def test_views_outside_the_geometry_come_last(tmp_path):
     write_subject(tmp_path)
     sa_only = geometry(views=["sa_1"])

@@ -5,7 +5,7 @@
 #SBATCH -n 16
 #SBATCH -t 0-2
 
-# Step 3: the ROI's extent over the training subjects, and the latent grid it
+# Step 4: the ROI's extent over the training subjects, and the latent grid it
 # suggests, to copy into the geometry yaml. Submit from the repo root, e.g.
 #   sbatch slurm/latent-extent.sh --dataset cmr --data_dir ../scratch/data/kaggle_niftis/train --su_per_lvox 1.8
 if [ $# -lt 1 ]; then

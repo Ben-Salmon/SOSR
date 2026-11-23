@@ -26,6 +26,7 @@ mrisr-evaluate = "mrisr_vae.evaluation.heldout:main"
 mrisr-score = "mrisr_vae.evaluation.score:main"
 mrisr-baselines = "mrisr_vae.evaluation.baselines:main"
 mrisr-breathhold = "mrisr_vae.preprocess.breathhold.optimise:main"
+mrisr-intensity-gain = "mrisr_vae.preprocess.intensity_gain:main"
 mrisr-register = "mrisr_vae.preprocess.registration:main"
 mrisr-latent-extent = "mrisr_vae.preprocess.latent_extent:main"
 
@@ -35,6 +36,8 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "jupyterlab>=4.6.6",
+    "matplotlib>=3.10.9",
     "pytest>=8.4.2",
 ]
 notebook = [
